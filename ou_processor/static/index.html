@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Школы · Обработка Excel</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header class="top"><a href="/" class="brand"><span class="mark">Ш</span><span>Школы<span class="brand-sub">Реестр учеников</span></span></a><span class="local"><span class="dot"></span>Локальный режим</span></header>
+<main>
+<div class="intro"><span class="eyebrow">EXCEL → ГОТОВЫЙ РЕЕСТР</span><h1>Одна школа. Все ученики.</h1><p>Загрузите таблицы — мы объединим названия школ, найдём адреса<br class="wide"> и соберём учеников и номера личных дел без повторов.</p></div>
+<div class="steps" aria-label="Этапы работы"><span><b>1</b> Загрузите Excel</span><i>→</i><span><b>2</b> Запустите обработку</span><i>→</i><span><b>3</b> Скачайте результат</span></div>
+<div class="layout">
+<section class="card upload-card"><div class="card-head"><h2>Исходные таблицы</h2><span class="muted">.xlsx</span></div>
+<form id="form"><fieldset id="controls">
+<label class="drop" id="drop" tabindex="0" for="files"><span class="file-icon" aria-hidden="true">↥</span><strong>Перетащите Excel сюда</strong><span>или <em>выберите файлы</em> на компьютере</span><small>До 10 файлов · до 20 МБ суммарно</small></label>
+<input type="file" id="files" multiple accept=".xlsx" class="sr-only" aria-label="Выбрать Excel-файлы">
+<ul id="file-list" class="file-list"></ul>
+<details id="settings"><summary>Настройки подключения <span id="connection" class="muted">Проверяем…</span></summary><div class="settings-body"><label for="token">API-ключ DaData</label><input type="password" id="token" autocomplete="off" placeholder="Введите ключ" maxlength="256"><small id="key-note">Ключ используется только для текущей обработки и не сохраняется.</small><label class="checkbox"><input type="checkbox" id="offline">Использовать только сохранённые ответы и реестр</label><small>Без новых запросов DaData. Ранее не найденные организации могут потребовать проверки.</small></div></details>
+<button type="submit" id="start" class="primary" disabled>Обработать таблицы <span aria-hidden="true">→</span></button>
+</fieldset></form>
+<div id="error" class="notice error" role="alert" hidden></div>
+<div id="progress-card" class="processing" hidden><div class="progress-label"><strong id="phase">Читаем файлы</strong><span id="percentage">0%</span></div><progress id="progress" max="100" value="0"></progress><p id="progress-note" class="muted" aria-live="polite">Подготавливаем обработку…</p><button id="retry" class="secondary" hidden>Проверить статус</button></div>
+</section>
+<aside class="card side"><span class="eyebrow">НА ВЫХОДЕ</span><h2>Таблица, с которой<br>можно работать</h2><ul class="benefits"><li><span>01</span><div><strong>Одно учреждение — одна строка</strong><p>Разные написания объединяются по установленному ИНН.</p></div></li><li><span>02</span><div><strong>Адрес, ФИО и номера дел</strong><p>Сохраняем связь каждого ученика с его личным делом.</p></div></li><li><span>03</span><div><strong>Спорные случаи отдельно</strong><p>Неоднозначные совпадения попадут на лист «Проверить».</p></div></li></ul><div class="source-box"><strong>DaData + Рособрнадзор</strong><p>Сначала ищем в DaData, затем — в резервном реестре аккредитации.</p><span id="registry" class="status">Проверяем реестр…</span></div></aside>
+</div>
+<section class="card result" id="result" hidden aria-labelledby="result-title"><div class="result-head"><div><span class="eyebrow">РЕЗУЛЬТАТ ПОСЛЕДНЕЙ ОБРАБОТКИ</span><h2 id="result-title">Таблица готова</h2></div><a id="download" class="primary download" download="schools.xlsx">Скачать Excel <span aria-hidden="true">↓</span></a></div><div id="metrics" class="metrics"></div><div id="warnings" aria-live="polite"></div><h3>Предпросмотр учреждений</h3><p id="preview-caption" class="muted"></p><div class="table-wrap"><table><thead><tr><th>Учреждение</th><th>Адрес</th><th>ФИО учеников</th><th>Номера дел</th></tr></thead><tbody id="preview"></tbody></table></div><p class="muted result-foot">DaData возвращает юридический адрес. Адрес из реестра отмечен в файле отдельно и требует сверки.</p></section>
+<details class="format"><summary>Какие столбцы должны быть в Excel?</summary><p>Обязательны «Образовательное учреждение» и «Вид образования» (или «Тип документа об образовании»). Для списка учеников добавьте «ФИО» и «Личное дело.Номер» или «Номер личного дела». Регион и город помогают точнее найти школу. Присланные ранее тестовые таблицы поддерживаются.</p></details>
+<footer>ФИО и номера личных дел обрабатываются на этом компьютере.<br>В DaData передаются только названия и география организаций.</footer>
+</main></body></html>
