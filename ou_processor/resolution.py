@@ -266,7 +266,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             if selected:
                 break
         registry_used, truncated = False, False
-        if not selected:
+        if not selected and registry is not None:
             if check_cancel:
                 check_cancel()
             registry_used = True
@@ -292,5 +292,6 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
         if on_progress:
             on_progress(index, len(result['groups']))
     result['resolution'] = {'groups': resolutions, 'candidates': candidates, 'requests': api.requests,
-                            'actual_requests': api.actual_requests, 'registry': registry.metadata}
+                            'actual_requests': api.actual_requests,
+                            'registry': registry.metadata if registry is not None else {}}
     return result

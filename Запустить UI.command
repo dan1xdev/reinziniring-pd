@@ -7,7 +7,7 @@ elif [[ -x ../../work/registry-venv/bin/python ]]; then
 else
   ui_python=python3
 fi
-if ! "$ui_python" -c 'import openpyxl, defusedxml' 2>/dev/null; then
+if ! "$ui_python" -c 'import openpyxl, defusedxml, keyring' 2>/dev/null; then
   echo 'Сначала установите зависимости по инструкции UI_README.txt.'
   read 'ui_reply?Нажмите Enter, чтобы закрыть окно.'
   exit 1

@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from ou_processor.web import Application, Handler, JobCancelled, UserError, unpack_uploads
 
 
@@ -23,7 +23,58 @@ def upload(name='test.xlsx'):
     return {'name':name, 'data':base64.b64encode(stream.getvalue()).decode()}
 
 
+def school_upload():
+    workbook = Workbook()
+    workbook.active.append(['Образовательное учреждение', 'Вид образования', 'ФИО', 'Личное дело.Номер'])
+    workbook.active.append(['ГБОУ г. Москвы «Школа № 1»', 'Среднее общее', 'Иванов Иван', '0001'])
+    stream = io.BytesIO()
+    workbook.save(stream)
+    return {'name':'schools.xlsx', 'data':base64.b64encode(stream.getvalue()).decode()}
+
+
 class UploadTests(unittest.TestCase):
+    def test_without_registry_processing_finishes_and_exports_review(self):
+        class EmptyClient:
+            def __init__(self, token):
+                self.token = token
+            def suggest(self, query):
+                return []
+        with tempfile.TemporaryDirectory() as root:
+            app = Application(Path(root)/'runs', Path(root)/'registry', Path(root)/'cache.json',
+                              token='test-key', client_factory=EmptyClient)
+            job_id = app.start({'files':[school_upload()]})
+            for _ in range(500):
+                if app.snapshot(job_id)['status'] != 'running':
+                    break
+                time.sleep(.01)
+            job = app.snapshot(job_id)
+            self.assertEqual(job['status'], 'done', job.get('error'))
+            self.assertEqual(job['summary']['review'], 1)
+            self.assertTrue(any('Резервный реестр недоступен' in warning for warning in job['warnings']))
+            book = load_workbook(Path(root)/'runs'/job_id/'result'/'schools.xlsx', read_only=True)
+            self.assertEqual(book['Проверить']['E2'].value, 'Иванов Иван')
+            self.assertEqual(book['Проверить']['F2'].value, '0001')
+            book.close()
+
+    def test_token_is_saved_and_reloaded_without_exposing_it(self):
+        class Store:
+            value = ''
+            def load(self): return self.value
+            def save(self, token): self.value = token
+            def delete(self): self.value = ''
+        with tempfile.TemporaryDirectory() as root:
+            store = Store()
+            app = Application(root, root, Path(root)/'cache.json', token_store=store)
+            with patch.object(app, 'run'):
+                app.start({'files':[upload()], 'token':'private-test-key', 'save_token':True})
+            self.assertEqual(store.value, 'private-test-key')
+            self.assertNotIn('private-test-key', json.dumps(app.settings()))
+            reopened = Application(root, root, Path(root)/'cache.json', token_store=store)
+            self.assertTrue(reopened.settings()['token_configured'])
+            self.assertTrue(reopened.settings()['token_saved'])
+            reopened.forget_token()
+            self.assertEqual(store.value, '')
+
     def test_invalid_extension(self):
         with self.assertRaises(UserError): unpack_uploads([upload('test.xls')])
 
@@ -149,3 +200,13 @@ class HTTPTests(unittest.TestCase):
         finally:
             app.jobs.pop(job_id,None)
             app.cancel_flags.pop(job_id,None)
+
+    def test_registry_retry_endpoint_starts_worker_without_blocking_request(self):
+        app = self.server.app
+        with patch.object(app, 'start_registry_update', return_value={
+            'phase':'checking', 'attempt':1, 'max_attempts':3, 'message':'Проверяем',
+            'retry_available':False}) as start:
+            status, data = self.call('/api/registry/retry', 'POST', headers={'X-CSRF-Token':app.csrf})
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(data)['attempt'], 1)
+        start.assert_called_once_with()

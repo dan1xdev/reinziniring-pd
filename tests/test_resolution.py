@@ -85,6 +85,31 @@ class ResolutionTests(unittest.TestCase):
         self.assertTrue(result['resolution']['groups'][0]['registry_used'])
         self.assertIsNotNone(result['resolution']['groups'][0]['selected'])
 
+    def test_without_registry_keeps_unmatched_school_and_student_for_review(self):
+        class API:
+            actual_requests=1
+            requests=[]
+            def search(self,*args): return []
+        r=record(record_id='1',student_name='Иванов Иван',personal_file_number='0001')
+        result={'records':[r],'groups':[dict(group_id='g',record_ids=['1'])],
+                'summary':{'selected_rows':1}}
+        resolve(result,API(),None,progress=False)
+        aggregate(result)
+        self.assertEqual(result['resolution']['registry'],{})
+        self.assertFalse(result['resolution']['groups'][0]['registry_used'])
+        self.assertEqual(result['review'][0]['students'],'Иванов Иван')
+        self.assertEqual(result['review'][0]['files'],'0001')
+
+    def test_without_registry_dadata_result_is_used(self):
+        class API:
+            actual_requests=1
+            requests=[]
+            def search(self,*args): return [candidate()]
+        result={'records':[record(record_id='1')],
+                'groups':[dict(group_id='g',record_ids=['1'])]}
+        resolve(result,API(),None,progress=False)
+        self.assertEqual(result['resolution']['groups'][0]['selected']['candidate_inn'],'123')
+
     def test_cancel_after_api_reply_skips_following_queries_and_registry(self):
         calls = []
         class API:

@@ -13,16 +13,19 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import sqlite3
 import threading
 import webbrowser
 import zipfile
 
 from .dadata import DaDataClient
+from .key_storage import TokenStore
 from .full_run import aggregate, save
 from .input import read_records
 from .pipeline import process
 from .registry import current_snapshot
 from .resolution import RegistrySearch, SearchCache, resolve
+from .registry_worker import RegistryWorker
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_BYTES = 100 * 1024 * 1024
@@ -71,9 +74,23 @@ def unpack_uploads(files):
 
 
 class Application:
-    def __init__(self, storage, registry, cache, token='', client_factory=DaDataClient):
+    def __init__(self, storage, registry, cache, token='', client_factory=DaDataClient,
+                 token_store=None, registry_worker=None):
         self.storage, self.registry, self.cache = Path(storage), Path(registry), Path(cache)
+        self.initial_token = token
         self.token, self.client_factory = token, client_factory
+        self.token_store = token_store
+        self.token_saved = False
+        if token_store:
+            try:
+                saved_token = token_store.load()
+                self.token_saved = bool(saved_token)
+                if not self.token:
+                    self.token = saved_token
+            except Exception:
+                # Недоступное системное хранилище не мешает обработке с введённым ключом.
+                pass
+        self.registry_worker = registry_worker or RegistryWorker(self.registry)
         self.csrf = secrets.token_urlsafe(32)
         self.jobs = {}
         self.cancel_flags = {}
@@ -86,8 +103,21 @@ class Application:
         except (ValueError, OSError, KeyError):
             snapshot = None
         date = snapshot[1].get('snapshot_date', '') if snapshot else ''
-        return {'csrf': self.csrf, 'token_configured': bool(self.token), 'registry_ready': bool(snapshot),
-                'registry_date': date, 'max_files': 10, 'max_mb': 100}
+        return {'csrf': self.csrf, 'token_configured': bool(self.token), 'token_saved': self.token_saved,
+                'registry_ready': bool(snapshot), 'registry_date': date,
+                'registry_update': self.registry_worker.snapshot(), 'max_files': 10, 'max_mb': 100}
+
+    def start_registry_update(self):
+        return self.registry_worker.start()
+
+    def forget_token(self):
+        if self.token_store:
+            try:
+                self.token_store.delete()
+            except Exception:
+                raise UserError('Не удалось удалить ключ из системного хранилища.') from None
+        self.token = self.initial_token
+        self.token_saved = False
 
     def start(self, payload):
         if not isinstance(payload, dict):
@@ -100,11 +130,18 @@ class Application:
         offline = payload.get('offline') is True
         if not token and not offline:
             raise UserError('Введите API-ключ DaData или выберите обработку по сохранённым ответам.')
-        if not self.settings()['registry_ready']:
-            raise UserError('Резервный реестр не загружен. Выполните команду из инструкции запуска.')
         with self.lock:
             if self.active:
                 raise UserError('Уже идёт обработка. Дождитесь её завершения.')
+            if payload.get('save_token') is True and payload.get('token'):
+                if not self.token_store:
+                    raise UserError('Системное хранилище ключей недоступно. Снимите флажок сохранения ключа.')
+                try:
+                    self.token_store.save(token)
+                except Exception:
+                    raise UserError('Не удалось сохранить ключ. Проверьте доступ к системному хранилищу или снимите флажок сохранения.') from None
+                self.token_saved = True
+            self.token = token
             job_id = secrets.token_hex(16)
             self.jobs[job_id] = {'id': job_id, 'status': 'running', 'phase': 'Читаем Excel',
                                  'progress': 2, 'done': 0, 'total': 0, 'error': ''}
@@ -178,7 +215,10 @@ class Application:
             result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
             self.change(job_id, phase='Ищем организации и адреса', progress=8, total=len(result['groups']))
             api = SearchCache(self.cache, None if offline else self.client_factory(token))
-            reserve = RegistrySearch(self.registry)
+            try:
+                reserve = RegistrySearch(self.registry)
+            except (ValueError, OSError, KeyError, sqlite3.Error):
+                reserve = None
             resolve(result, api, reserve, progress=False,
                 on_progress=lambda done, total: self.progress(job_id, done, total),
                 check_cancel=lambda: self.check_cancel(job_id))
@@ -195,7 +235,9 @@ class Application:
             if errors:
                 warnings.append('Не все запросы DaData выполнены. Проверьте лист «Запросы DaData»: ' + ', '.join(sorted(set(errors))))
             if offline:
-                warnings.append('Использованы сохранённые ответы DaData и локальный реестр. Новых запросов не было.')
+                warnings.append('Использованы только сохранённые ответы DaData. Новых запросов не было.')
+            if reserve is None:
+                warnings.append('Резервный реестр недоступен. Ненайденные учреждения сохранены на листе «Проверить».')
             missing = summary['Строк без данных ученика']
             if missing:
                 warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
@@ -294,6 +336,14 @@ class Handler(BaseHTTPRequestHandler):
             job = self.app.cancel(cancel_match[1])
             return self.send(202 if job and job['status'] == 'cancelling' else 200 if job else 404,
                              job or {'error': 'Задача не найдена.'})
+        if self.path == '/api/registry/retry':
+            return self.send(202, self.app.start_registry_update())
+        if self.path == '/api/token/forget':
+            try:
+                self.app.forget_token()
+                return self.send(200, {'token_configured': False, 'token_saved': False})
+            except UserError as error:
+                return self.send(400, {'error': str(error)})
         if self.path != '/api/jobs':
             return self.send(404, {'error': 'Не найдено.'})
         try:
@@ -323,12 +373,13 @@ def main():
         if existing.exists():
             args.cache.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(existing, args.cache)
-    app = Application(args.storage, args.registry, args.cache, token)
+    app = Application(args.storage, args.registry, args.cache, token, token_store=TokenStore())
     try:
         server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     except OSError:
         parser.exit(1, 'Порт занят. Закройте старый экземпляр или укажите другой --port.\n')
     server.app = app
+    app.start_registry_update()
     url = f'http://127.0.0.1:{server.server_port}'
     print(f'Откройте {url}. Для остановки нажмите Ctrl+C.', flush=True)
     if not args.no_browser:

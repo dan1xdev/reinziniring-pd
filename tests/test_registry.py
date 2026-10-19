@@ -4,10 +4,14 @@ from io import BytesIO
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from urllib.error import URLError
 import zipfile
 
 from ou_processor.registry import build_index, cache_lock, current_snapshot, lookup, update
+from ou_processor.registry_worker import RegistryWorker
+from ou_processor.web import Application
 
 
 XML = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -52,6 +56,53 @@ class Server:
 
 
 class RegistryTests(unittest.TestCase):
+    def test_background_auto_update_and_existing_snapshot_during_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            update(cache, opener=Server())
+            entered = threading.Event()
+            release = threading.Event()
+            def paused_update(path):
+                entered.set()
+                release.wait(5)
+                return update(path, opener=Server(date='20261019'))
+            worker = RegistryWorker(cache, updater=paused_update, delays=(0, 0))
+            app = Application(cache / 'runs', cache, cache / 'dadata.json', registry_worker=worker)
+            app.start_registry_update()
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(worker.snapshot()['attempt'], 1)
+            self.assertEqual(app.settings()['registry_date'], '20261018')
+            release.set()
+            worker.thread.join(5)
+            self.assertEqual(worker.snapshot()['phase'], 'ready')
+            self.assertEqual(app.settings()['registry_date'], '20261019')
+
+    def test_tls_timeout_retries_preserve_snapshot_and_release_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            update(cache, opener=Server())
+            original = (cache / 'current.json').read_bytes()
+            calls = []
+            def failing_opener(request, timeout):
+                calls.append(request.method)
+                raise URLError(TimeoutError('_ssl.c:1063: The handshake operation timed out'))
+            worker = RegistryWorker(cache, updater=lambda path: update(path, opener=failing_opener), delays=(0, 0))
+            worker.start()
+            worker.thread.join(5)
+            self.assertEqual(calls, ['HEAD'] * 3)
+            self.assertEqual(worker.snapshot()['phase'], 'error')
+            self.assertEqual(worker.snapshot()['attempt'], 3)
+            self.assertIn('таймаут', worker.snapshot()['message'])
+            self.assertTrue(worker.snapshot()['retry_available'])
+            self.assertEqual((cache / 'current.json').read_bytes(), original)
+            self.assertFalse((cache / 'update.lock').exists())
+            self.assertEqual(json.loads((cache / 'last_check.json').read_text())['status'], 'error')
+            worker.updater = lambda path: update(path, opener=Server())
+            worker.start()
+            worker.thread.join(5)
+            self.assertEqual(worker.snapshot()['phase'], 'ready')
+            self.assertEqual((cache / 'current.json').read_bytes(), original)
+
     def test_update_then_head_only_and_lookup(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
