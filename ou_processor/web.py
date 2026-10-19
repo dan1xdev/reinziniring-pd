@@ -25,11 +25,16 @@ from .registry import current_snapshot
 from .resolution import RegistrySearch, SearchCache, resolve
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_BYTES = 20 * 1024 * 1024
-MAX_BODY = 29 * 1024 * 1024
+MAX_BYTES = 100 * 1024 * 1024
+MAX_BODY = 140 * 1024 * 1024
+MAX_UNPACKED_BYTES = 512 * 1024 * 1024
 
 
 class UserError(Exception):
+    pass
+
+
+class JobCancelled(Exception):
     pass
 
 
@@ -49,12 +54,12 @@ def unpack_uploads(files):
             raise UserError('Файл повреждён при загрузке.') from None
         total += len(content)
         if total > MAX_BYTES:
-            raise UserError('Суммарный размер файлов не должен превышать 20 МБ.')
+            raise UserError('Суммарный размер файлов не должен превышать 100 МБ.')
         try:
             with zipfile.ZipFile(io.BytesIO(content)) as archive:
                 if '[Content_Types].xml' not in archive.namelist() or 'xl/workbook.xml' not in archive.namelist():
                     raise ValueError()
-                if sum(info.file_size for info in archive.infolist()) > 100 * 1024 * 1024:
+                if sum(info.file_size for info in archive.infolist()) > MAX_UNPACKED_BYTES:
                     raise UserError('Книга слишком большая после распаковки. Разделите её на части.')
         except (zipfile.BadZipFile, ValueError):
             raise UserError(f'«{name}» не является корректной книгой .xlsx или защищена паролем.') from None
@@ -71,6 +76,7 @@ class Application:
         self.token, self.client_factory = token, client_factory
         self.csrf = secrets.token_urlsafe(32)
         self.jobs = {}
+        self.cancel_flags = {}
         self.lock = threading.Lock()
         self.active = None
 
@@ -81,7 +87,7 @@ class Application:
             snapshot = None
         date = snapshot[1].get('snapshot_date', '') if snapshot else ''
         return {'csrf': self.csrf, 'token_configured': bool(self.token), 'registry_ready': bool(snapshot),
-                'registry_date': date, 'max_files': 10, 'max_mb': 20}
+                'registry_date': date, 'max_files': 10, 'max_mb': 100}
 
     def start(self, payload):
         if not isinstance(payload, dict):
@@ -102,6 +108,7 @@ class Application:
             job_id = secrets.token_hex(16)
             self.jobs[job_id] = {'id': job_id, 'status': 'running', 'phase': 'Читаем Excel',
                                  'progress': 2, 'done': 0, 'total': 0, 'error': ''}
+            self.cancel_flags[job_id] = threading.Event()
             self.active = job_id
         thread = threading.Thread(target=self.run, args=(job_id, uploaded, token, offline), daemon=True)
         thread.start()
@@ -109,6 +116,8 @@ class Application:
 
     def change(self, job_id, **fields):
         with self.lock:
+            if self.jobs[job_id]['status'] == 'cancelling' and 'status' not in fields:
+                return
             self.jobs[job_id].update(fields)
 
     def snapshot(self, job_id):
@@ -116,32 +125,69 @@ class Application:
             job = self.jobs.get(job_id)
             return dict(job) if job else None
 
+    def cancel(self, job_id):
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                return None
+            if job['status'] == 'running':
+                self.cancel_flags.setdefault(job_id, threading.Event()).set()
+                job.update(status='cancelling', phase='Отменяем обработку')
+            return dict(job)
+
+    def cancellation_requested(self, job_id):
+        flag = self.cancel_flags.get(job_id)
+        return bool(flag and flag.is_set())
+
+    def check_cancel(self, job_id):
+        if self.cancellation_requested(job_id):
+            raise JobCancelled()
+
+    def progress(self, job_id, done, total):
+        self.check_cancel(job_id)
+        self.change(job_id, done=done, total=total, progress=8 + round(82 * done / max(1, total)))
+
+    def finish(self, job_id, **fields):
+        with self.lock:
+            if self.cancellation_requested(job_id):
+                raise JobCancelled()
+            self.jobs[job_id].update(status='done', phase='Готово', progress=100, **fields)
+
     def run(self, job_id, uploaded, token, offline):
         reserve = None
+        was_cancelled = False
+        directory = self.storage / job_id
         try:
-            directory = self.storage / job_id
+            self.check_cancel(job_id)
             directory.mkdir(parents=True, mode=0o700)
             paths = []
             for index, (name, content) in enumerate(uploaded):
+                self.check_cancel(job_id)
                 folder = directory / 'inputs' / str(index)
                 folder.mkdir(parents=True)
                 path = folder / name
                 path.write_bytes(content)
                 paths.append(path)
             config = json.loads((ROOT / 'config.json').read_text())
-            records, sources = read_records(paths)
+            records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id))
+            self.check_cancel(job_id)
             if len(records) > 5000:
                 raise UserError('В прототипе можно обработать до 5 000 строк за запуск. Разделите таблицу.')
             result = process(records, config)
+            self.check_cancel(job_id)
             result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
             self.change(job_id, phase='Ищем организации и адреса', progress=8, total=len(result['groups']))
             api = SearchCache(self.cache, None if offline else self.client_factory(token))
             reserve = RegistrySearch(self.registry)
-            resolve(result, api, reserve, progress=False, on_progress=lambda done, total: self.change(
-                job_id, done=done, total=total, progress=8 + round(82 * done / max(1, total))))
+            resolve(result, api, reserve, progress=False,
+                on_progress=lambda done, total: self.progress(job_id, done, total),
+                check_cancel=lambda: self.check_cancel(job_id))
+            self.check_cancel(job_id)
             self.change(job_id, phase='Собираем итоговую таблицу', progress=93)
             aggregate(result)
+            self.check_cancel(job_id)
             save(result, directory / 'result')
+            self.check_cancel(job_id)
             summary = result['full_summary']
             errors = [r['status'] for r in result['resolution']['requests'] if r['status'] != 'OK']
             issues = summary['Исходных строк на проверку'] + result['summary']['selection_review_rows']
@@ -153,24 +199,37 @@ class Application:
             missing = summary['Строк без данных ученика']
             if missing:
                 warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
-            self.change(job_id, status='done', phase='Готово', progress=100,
+            self.finish(job_id,
                 summary={'rows': summary['Входных строк'], 'schools': len(result['schools']),
                          'students': len(result['students']), 'review': issues,
                          'addresses': summary['Учреждений с адресом'],
                          'excluded': result['summary']['excluded_rows']},
                 warnings=warnings, partial=bool(errors), preview=result['schools'][:20],
                 download=f'/api/jobs/{job_id}/download')
+        except JobCancelled:
+            was_cancelled = True
         except (UserError, ValueError) as error:
-            self.change(job_id, status='error', phase='Обработка не завершена', error=str(error))
+            if self.cancellation_requested(job_id):
+                was_cancelled = True
+            else:
+                self.change(job_id, status='error', phase='Обработка не завершена', error=str(error))
         except Exception:
-            # Содержимое файлов и ключ не попадают в HTTP-логи и сообщения об ошибках.
-            self.change(job_id, status='error', phase='Обработка не завершена',
-                        error='Не удалось обработать файл. Проверьте формат книги и доступность папки результатов.')
+            if self.cancellation_requested(job_id):
+                was_cancelled = True
+            else:
+                # Содержимое файлов и ключ не попадают в HTTP-логи и сообщения об ошибках.
+                self.change(job_id, status='error', phase='Обработка не завершена',
+                            error='Не удалось обработать файл. Проверьте формат книги и доступность папки результатов.')
         finally:
             if reserve:
                 reserve.connection.close()
+            if was_cancelled:
+                shutil.rmtree(directory, ignore_errors=True)
             with self.lock:
+                if was_cancelled:
+                    self.jobs[job_id].update(status='cancelled', phase='Обработка отменена')
                 self.active = None
+                self.cancel_flags.pop(job_id, None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -230,12 +289,17 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get('Origin')
         if origin and origin != 'http://' + self.headers.get('Host', ''):
             return self.send(403, {'error': 'Недопустимый источник запроса.'})
+        cancel_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/cancel', self.path)
+        if cancel_match:
+            job = self.app.cancel(cancel_match[1])
+            return self.send(202 if job and job['status'] == 'cancelling' else 200 if job else 404,
+                             job or {'error': 'Задача не найдена.'})
         if self.path != '/api/jobs':
             return self.send(404, {'error': 'Не найдено.'})
         try:
             size = int(self.headers.get('Content-Length', '0'))
             if not 0 < size <= MAX_BODY:
-                raise UserError('Суммарный размер файлов не должен превышать 20 МБ.')
+                raise UserError('Суммарный размер файлов не должен превышать 100 МБ.')
             self.connection.settimeout(60)
             payload = json.loads(self.rfile.read(size))
             job_id = self.app.start(payload)

@@ -36,10 +36,12 @@ def personal_file_number(cell):
     return text(value)
 
 
-def read_records(paths):
+def read_records(paths, should_cancel=None):
     records, sources = [], []
     seen_paths = set()
     for filename in paths:
+        if should_cancel:
+            should_cancel()
         path = Path(filename).expanduser().resolve()
         if path in seen_paths:
             continue
@@ -57,7 +59,7 @@ def read_records(paths):
                 if "100 записей" in workbook.sheetnames and sheet.title != "100 записей":
                     skipped.append(sheet.title)
                     continue
-                found = read_sheet(sheet, path.name, source_id)
+                found = read_sheet(sheet, path.name, source_id, should_cancel)
                 if found is None:
                     skipped.append(sheet.title)
                     continue
@@ -72,10 +74,12 @@ def read_records(paths):
     return records, sources
 
 
-def read_sheet(sheet, filename, source_id):
+def read_sheet(sheet, filename, source_id, should_cancel=None):
     mapping = None
     records = []
     for row_number, cells in enumerate(sheet.iter_rows(), 1):
+        if should_cancel and row_number % 100 == 1:
+            should_cancel()
         values = [cell.value for cell in cells]
         if mapping is None:
             if row_number > 30:

@@ -247,20 +247,28 @@ class RegistrySearch:
         return result, len(found) > 2000
 
 
-def resolve(result, api, registry, progress=True, on_progress=None):
+def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None):
     by_id = {r['record_id']: r for r in result['records']}
     resolutions, candidates = [], []
     for index, group in enumerate(result['groups'], 1):
+        if check_cancel:
+            check_cancel()
         record = by_id[group['record_ids'][0]]
         found = []
         selected = None
         for query in queries(record):
+            if check_cancel:
+                check_cancel()
             found.extend(api.search(query, group['group_id']))
+            if check_cancel:
+                check_cancel()
             selected, ranked = choose(record, found)
             if selected:
                 break
         registry_used, truncated = False, False
         if not selected:
+            if check_cancel:
+                check_cancel()
             registry_used = True
             reserve, truncated = registry.search(record)
             chosen, reserve_ranked = choose(record, reserve)

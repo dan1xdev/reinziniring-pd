@@ -9,14 +9,14 @@
 <div class="layout">
 <section class="card upload-card"><div class="card-head"><h2>Исходные таблицы</h2><span class="muted">.xlsx</span></div>
 <form id="form"><fieldset id="controls">
-<label class="drop" id="drop" tabindex="0" for="files"><span class="file-icon" aria-hidden="true">↥</span><strong>Перетащите Excel сюда</strong><span>или <em>выберите файлы</em> на компьютере</span><small>До 10 файлов · до 20 МБ суммарно</small></label>
+<label class="drop" id="drop" tabindex="0" for="files"><span class="file-icon" aria-hidden="true">↥</span><strong>Перетащите Excel сюда</strong><span>или <em>выберите файлы</em> на компьютере</span><small>До 10 файлов · до 100 МБ суммарно</small></label>
 <input type="file" id="files" multiple accept=".xlsx" class="sr-only" aria-label="Выбрать Excel-файлы">
 <ul id="file-list" class="file-list"></ul>
 <details id="settings"><summary>Настройки подключения <span id="connection" class="muted">Проверяем…</span></summary><div class="settings-body"><label for="token">API-ключ DaData</label><input type="password" id="token" autocomplete="off" placeholder="Введите ключ" maxlength="256"><small id="key-note">Ключ используется только для текущей обработки и не сохраняется.</small><label class="checkbox"><input type="checkbox" id="offline">Использовать только сохранённые ответы и реестр</label><small>Без новых запросов DaData. Ранее не найденные организации могут потребовать проверки.</small></div></details>
 <button type="submit" id="start" class="primary" disabled>Обработать таблицы <span aria-hidden="true">→</span></button>
 </fieldset></form>
 <div id="error" class="notice error" role="alert" hidden></div>
-<div id="progress-card" class="processing" hidden><div class="progress-label"><strong id="phase">Читаем файлы</strong><span id="percentage">0%</span></div><progress id="progress" max="100" value="0"></progress><p id="progress-note" class="muted" aria-live="polite">Подготавливаем обработку…</p><button id="retry" class="secondary" hidden>Проверить статус</button></div>
+<div id="progress-card" class="processing" hidden><div class="progress-label"><strong id="phase">Читаем файлы</strong><span id="percentage">0%</span></div><progress id="progress" max="100" value="0"></progress><p id="progress-note" class="muted" aria-live="polite">Подготавливаем обработку…</p><button id="cancel" type="button" class="secondary" hidden>Отменить обработку</button><button id="retry" type="button" class="secondary" hidden>Проверить статус</button></div>
 </section>
 <aside class="card side"><span class="eyebrow">НА ВЫХОДЕ</span><h2>Таблица, с которой<br>можно работать</h2><ul class="benefits"><li><span>01</span><div><strong>Одно учреждение — одна строка</strong><p>Разные написания объединяются по установленному ИНН.</p></div></li><li><span>02</span><div><strong>Адрес, ФИО и номера дел</strong><p>Сохраняем связь каждого ученика с его личным делом.</p></div></li><li><span>03</span><div><strong>Спорные случаи отдельно</strong><p>Неоднозначные совпадения попадут на лист «Проверить».</p></div></li></ul><div class="source-box"><strong>DaData + Рособрнадзор</strong><p>Сначала ищем в DaData, затем — в резервном реестре аккредитации.</p><span id="registry" class="status">Проверяем реестр…</span></div></aside>
 </div>

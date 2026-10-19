@@ -7,10 +7,11 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from openpyxl import Workbook
-from ou_processor.web import Application, Handler, UserError, unpack_uploads
+from ou_processor.web import Application, Handler, JobCancelled, UserError, unpack_uploads
 
 
 def upload(name='test.xlsx'):
@@ -60,6 +61,30 @@ class UploadTests(unittest.TestCase):
                 with self.assertRaisesRegex(UserError,'Уже идёт'):
                     app.start({'files':[upload()]})
 
+    def test_cancel_stops_worker_and_removes_uploaded_file(self):
+        entered, release = threading.Event(), threading.Event()
+        def paused_read(paths, should_cancel):
+            entered.set()
+            release.wait(5)
+            should_cancel()
+        with tempfile.TemporaryDirectory() as root:
+            app=Application(Path(root)/'runs',root,Path(root)/'cache.json',token='key')
+            with patch.object(app,'settings',return_value={'registry_ready':True}), patch(
+                'ou_processor.web.read_records',side_effect=paused_read):
+                job_id=app.start({'files':[upload()]})
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(app.cancel(job_id)['status'],'cancelling')
+                with self.assertRaises(JobCancelled):
+                    app.finish(job_id,summary={})
+                release.set()
+                for _ in range(200):
+                    if app.snapshot(job_id)['status']=='cancelled':
+                        break
+                    time.sleep(.01)
+                self.assertEqual(app.snapshot(job_id)['status'],'cancelled')
+                self.assertIsNone(app.active)
+                self.assertFalse((Path(root)/'runs'/job_id).exists())
+
 
 class HTTPTests(unittest.TestCase):
     @classmethod
@@ -108,3 +133,19 @@ class HTTPTests(unittest.TestCase):
     def test_unknown_download_cannot_read_files(self):
         status,_=self.call('/api/jobs/../../README.txt/download')
         self.assertEqual(status,404)
+
+    def test_cancel_endpoint_requires_csrf_and_stops_running_job(self):
+        job_id='a'*32
+        app=self.server.app
+        app.jobs[job_id]={'id':job_id,'status':'running','phase':'Ищем организации','progress':30}
+        app.cancel_flags[job_id]=threading.Event()
+        try:
+            path=f'/api/jobs/{job_id}/cancel'
+            self.assertEqual(self.call(path,'POST')[0],403)
+            status,data=self.call(path,'POST',headers={'X-CSRF-Token':app.csrf})
+            self.assertEqual(status,202)
+            self.assertEqual(json.loads(data)['status'],'cancelling')
+            self.assertTrue(app.cancel_flags[job_id].is_set())
+        finally:
+            app.jobs.pop(job_id,None)
+            app.cancel_flags.pop(job_id,None)

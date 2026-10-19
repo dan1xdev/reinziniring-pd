@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from ou_processor.resolution import choose, SearchCache, resolve
 from ou_processor.full_run import aggregate
+from ou_processor.web import JobCancelled
 
 
 def record(name='ГБОУ школа № 1', city='Москва', region='Москва', **extra):
@@ -83,6 +84,24 @@ class ResolutionTests(unittest.TestCase):
         resolve(result,API(),Registry(),progress=False)
         self.assertTrue(result['resolution']['groups'][0]['registry_used'])
         self.assertIsNotNone(result['resolution']['groups'][0]['selected'])
+
+    def test_cancel_after_api_reply_skips_following_queries_and_registry(self):
+        calls = []
+        class API:
+            def search(self, query, group_id):
+                calls.append(query)
+                return []
+        class Registry:
+            def search(self, record):
+                raise AssertionError('После отмены реестр не запрашивается')
+        result={'records':[record(record_id='1')],
+                'groups':[dict(group_id='g',record_ids=['1'])]}
+        def check_cancel():
+            if calls:
+                raise JobCancelled()
+        with self.assertRaises(JobCancelled):
+            resolve(result,API(),Registry(),progress=False,check_cancel=check_cancel)
+        self.assertEqual(len(calls),1)
 
     def test_music_school_is_not_general_school(self):
         selected,_=choose(record(city='Можайск',region='Московская область'),[

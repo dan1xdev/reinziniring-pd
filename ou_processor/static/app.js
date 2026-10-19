@@ -22,7 +22,7 @@ function addFiles(incoming) {
     if (!file.name.toLowerCase().endsWith('.xlsx') || file.name.startsWith('~$')) return showError('Выберите книгу Excel в формате .xlsx.');
     if (!next.some(x => x.name === file.name && x.size === file.size && x.lastModified === file.lastModified)) next.push(file);
   }
-  if (next.length > 10 || next.reduce((n, file) => n + file.size, 0) > 20 * 1024 * 1024) return showError('Можно загрузить до 10 файлов общим размером не больше 20 МБ.');
+  if (next.length > 10 || next.reduce((n, file) => n + file.size, 0) > 100 * 1024 * 1024) return showError('Можно загрузить до 10 файлов общим размером не больше 100 МБ.');
   files = next; renderFiles();
 }
 function renderFiles() {
@@ -61,14 +61,24 @@ $('form').onsubmit = async e => {
   if (!config.token_configured && !$('token').value.trim() && !$('offline').checked) {
     $('settings').open = true; $('token').focus(); return showError('Введите API-ключ DaData в настройках подключения.');
   }
-  showError(''); setBusy(true); $('result').hidden = true; $('progress-card').hidden = false;
+  showError(''); setBusy(true); currentJob = null; $('cancel').hidden = true;
+  $('result').hidden = true; $('progress-card').hidden = false;
   $('phase').textContent = 'Загружаем файлы'; $('progress').value = 0; $('percentage').textContent = '0%'; $('progress-note').textContent = 'Подготавливаем таблицы…';
   try {
     const encoded = await Promise.all(files.map(encodeFile));
     const job = await request('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf}, body:JSON.stringify({files:encoded, token:$('token').value, offline:$('offline').checked})});
     $('token').value = ''; updateConnection(); currentJob = job.id; sessionStorage.setItem('schools-job', currentJob); poll();
-  } catch (error) { showError(error.message); $('progress-card').hidden = true; setBusy(false); }
+  } catch (error) { showError(error.message); $('progress-card').hidden = true; $('cancel').hidden = true; setBusy(false); }
 };
+async function cancelJob() {
+  if (!currentJob || !busy) return;
+  $('cancel').disabled = true;
+  try {
+    await request('/api/jobs/' + currentJob + '/cancel', {method:'POST', headers:{'X-CSRF-Token':config.csrf}});
+    poll();
+  } catch (error) { showError('Не удалось отменить обработку: ' + error.message); $('cancel').disabled = false; }
+}
+$('cancel').onclick = cancelJob;
 async function poll() {
   clearTimeout(timer); $('retry').hidden = true;
   try {
@@ -76,9 +86,16 @@ async function poll() {
     showError(''); $('progress-card').hidden = false;
     $('phase').textContent = job.phase; $('progress').value = job.progress; $('percentage').textContent = job.progress + '%';
     $('progress-note').textContent = job.total ? `Проверено групп учреждений: ${job.done} из ${job.total}` : 'Подготавливаем данные…';
-    if (job.status === 'running') { setBusy(true); timer = setTimeout(poll, 1000); }
-    else if (job.status === 'error') { showError(job.error); $('progress-card').hidden = true; setBusy(false); }
-    else { setBusy(false); $('progress-card').hidden = true; renderResult(job); }
+    if (job.status === 'running' || job.status === 'cancelling') {
+      setBusy(true); $('cancel').hidden = false; $('cancel').disabled = job.status === 'cancelling';
+      $('cancel').textContent = job.status === 'cancelling' ? 'Отменяем…' : 'Отменить обработку';
+      timer = setTimeout(poll, 1000);
+    } else {
+      setBusy(false); $('cancel').hidden = true;
+      if (job.status === 'cancelled') $('progress-note').textContent = 'Можно запустить новую обработку.';
+      else if (job.status === 'error') { showError(job.error); $('progress-card').hidden = true; }
+      else { $('progress-card').hidden = true; renderResult(job); }
+    }
   } catch (error) { showError('Не удалось получить статус: ' + error.message); $('retry').hidden = false; }
 }
 $('retry').onclick = poll;
@@ -115,7 +132,7 @@ async function init() {
     if (!config.registry_ready) showError('Сначала загрузите резервный реестр по инструкции UI_README.txt: python -m ou_processor.registry update');
     updateButton();
     currentJob = sessionStorage.getItem('schools-job');
-    if (currentJob) { const previous = await request('/api/jobs/' + currentJob).catch(() => null); if (previous) { setBusy(previous.status === 'running'); poll(); } else sessionStorage.removeItem('schools-job'); }
+    if (currentJob) { const previous = await request('/api/jobs/' + currentJob).catch(() => null); if (previous) { setBusy(['running','cancelling'].includes(previous.status)); poll(); } else sessionStorage.removeItem('schools-job'); }
   } catch (error) { showError('Сервер недоступен. Запустите приложение по инструкции и обновите страницу.'); }
 }
 init();
