@@ -3,7 +3,17 @@ const $ = id => document.getElementById(id);
 let files = [], config = null, busy = false, currentJob = null, timer = null;
 function showError(message) { $('error').textContent = message; $('error').hidden = !message; }
 function setBusy(value) { busy = value; $('controls').disabled = value; updateButton(); }
-function updateButton() { $('start').disabled = busy || !config?.registry_ready || !files.length; }
+function updateButton() {
+  $('start').disabled = busy || !config?.registry_ready || !files.length;
+  $('start').firstChild.textContent = !config?.registry_ready ? 'Реестр не загружен ' : !files.length ? 'Сначала загрузите Excel ' : 'Обработать таблицы ';
+}
+function updateConnection() {
+  $('connection').textContent = $('offline').checked ? 'Без новых запросов DaData'
+    : $('token').value.trim() ? 'Ключ введён — проверим при обработке'
+    : config?.token_configured ? 'Ключ задан на сервере' : 'Нужен ключ DaData';
+}
+$('token').addEventListener('input', updateConnection);
+$('offline').addEventListener('change', updateConnection);
 function addFiles(incoming) {
   if (busy) return;
   showError('');
@@ -56,7 +66,7 @@ $('form').onsubmit = async e => {
   try {
     const encoded = await Promise.all(files.map(encodeFile));
     const job = await request('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf}, body:JSON.stringify({files:encoded, token:$('token').value, offline:$('offline').checked})});
-    $('token').value = ''; currentJob = job.id; sessionStorage.setItem('schools-job', currentJob); poll();
+    $('token').value = ''; updateConnection(); currentJob = job.id; sessionStorage.setItem('schools-job', currentJob); poll();
   } catch (error) { showError(error.message); $('progress-card').hidden = true; setBusy(false); }
 };
 async function poll() {
@@ -96,7 +106,7 @@ function renderResult(job) {
 async function init() {
   try {
     config = await request('/api/config');
-    $('connection').textContent = config.token_configured ? 'DaData подключена' : 'Нужен ключ DaData';
+    updateConnection();
     if (config.token_configured) { $('token').placeholder = 'Ключ уже настроен'; $('key-note').textContent = 'Настроенный ключ хранится только в памяти сервера. Можно указать другой для этого запуска.'; }
     else $('settings').open = true;
     const d = config.registry_date;
