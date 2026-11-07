@@ -1,5 +1,3 @@
-"""Проверки сообщений об обязательных колонках (задача 1.1, ТЗ v2 п.3.2)."""
-
 from pathlib import Path
 import tempfile
 import unittest
@@ -74,6 +72,55 @@ class RequiredFieldMessageTests(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 read_records([path])
         self.assertIn("«ФИО»", str(ctx.exception))
+
+class DuplicateTests(unittest.TestCase):
+    def read(self, rows):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            make_book(path, [
+                ["ФИО", "Образовательное учреждение", "Вид образования", "Личное дело.Номер"],
+                *rows
+            ])
+            return read_records([path])
+
+    def test_exact_duplicate_removed(self):
+        rows = [
+            ["Иванов", "Школа 1", "Среднее общее", "001"],
+            ["Иванов", "Школа 1", "Среднее общее", "001"],
+            ["Петров", "Школа 1", "Среднее общее", "002"]
+        ]
+        records, sources = self.read(rows)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(sources[0]["duplicates_removed"], 1)
+
+    def test_conflicting_number_kept_and_flagged(self):
+        rows = [
+            ["Иванов", "Школа 1", "Среднее общее", "001"],
+            ["Сидоров", "Школа 1", "Среднее общее", "001"]
+        ]
+        records, sources = self.read(rows)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(records[0]["input_conflict"])
+        self.assertTrue(records[1]["input_conflict"])
+
+    def test_empty_numbers_not_deduplicated(self):
+        rows = [
+            ["Иванов", "Школа 1", "Среднее общее", ""],
+            ["Петров", "Школа 1", "Среднее общее", ""]
+        ]
+        records, _ = self.read(rows)
+        self.assertEqual(len(records), 2)
+
+    def test_same_number_and_name_but_different_school_is_conflict(self):
+        rows = [
+            ["Иванов", "Школа 1", "Среднее общее", "001"],
+            ["Иванов", "Школа 2", "Среднее общее", "001"]
+        ]
+        records, sources = self.read(rows)
+        
+        self.assertEqual(len(records), 2)
+        self.assertTrue(records[0]["input_conflict"])
+        self.assertTrue(records[1]["input_conflict"])
 
 
 if __name__ == "__main__":

@@ -62,6 +62,43 @@ def _missing_message(filename, sheet, seen, header_found):
         parts.append("не найдены обязательные колонки: " + "; ".join(missing) + ".")
     return " ".join(parts)
 
+def dedupe_personal_files(records, sources):
+    by_number = {}
+    unique_records = []
+    removed_count = 0
+
+    for r in records:
+        r["input_conflict"] = False 
+        num = r.get("personal_file_number")
+        
+        if not num:
+            unique_records.append(r)
+            continue
+            
+        if num not in by_number:
+            by_number[num] = r
+            unique_records.append(r)
+        else:
+            existing = by_number[num]
+            is_exact_duplicate = (
+                    r.get("student_name") == existing.get("student_name") and
+                    r.get("name") == existing.get("name") and
+                    r.get("education") == existing.get("education") and
+                    r.get("document") == existing.get("document")
+            )
+
+            if is_exact_duplicate:
+                removed_count += 1
+            else:
+                r["input_conflict"] = True
+                existing["input_conflict"] = True
+                unique_records.append(r)
+
+    if sources:
+        sources[-1]["duplicates_removed"] = sources[-1].get("duplicates_removed", 0) + removed_count
+
+    return unique_records
+
 
 def read_records(paths, should_cancel=None):
     records, sources = [], []
@@ -106,6 +143,9 @@ def read_records(paths, should_cancel=None):
             
         sources.append({"file": path.name, "source_id": source_id, "sha256": digest,
                         "rows": count, "skipped_sheets": skipped})
+
+        records = dedupe_personal_files(records, sources)
+
     return records, sources
 
 
