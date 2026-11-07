@@ -25,6 +25,15 @@ ALIASES = {
     "postal_code_raw": ["Индекс", "Почтовый индекс"],
 }
 
+# Обязательные поля: имя файла всегда; вид образования - либо колонка, либо документ.
+REQUIRED_GROUPS = [("name",), ("education", "document")]
+
+REQUIRED_LABELS = {
+    "name": "Образовательное учреждение",
+    "education": "Вид образования",
+    "document": "Тип документа об образовании",
+    "student_name": "ФИО",
+}
 
 def personal_file_number(cell):
     # Сохраняем ведущие нули, в том числе заданные простым числовым форматом Excel.
@@ -34,6 +43,24 @@ def personal_file_number(cell):
         if number_format and set(number_format) == {"0"}:
             return str(int(value)).zfill(len(number_format))
     return text(value)
+
+
+def _missing_message(filename, sheet, seen, header_found):
+    # Меняем эту строку: теперь мы берем все найденные колонки, у которых есть русская метка
+    found = [REQUIRED_LABELS[f] for f in seen if f in REQUIRED_LABELS]
+    
+    missing = []
+    for group in REQUIRED_GROUPS:
+        if not any(f in seen for f in group):
+            missing.append(" или ".join(f"«{REQUIRED_LABELS[f]}»" for f in group))
+    parts = [f"{filename}/«{sheet}»:"]
+    if not header_found:
+        parts.append("не найдена строка заголовков.")
+    if found:
+        parts.append("найдены колонки: " + ", ".join(f"«{f}»" for f in found) + ".")
+    if missing:
+        parts.append("не найдены обязательные колонки: " + "; ".join(missing) + ".")
+    return " ".join(parts)
 
 
 def read_records(paths, should_cancel=None):
@@ -53,22 +80,30 @@ def read_records(paths, should_cancel=None):
         workbook = load_workbook(path, read_only=True, data_only=False)
         count = 0
         skipped = []
+        diagnostics = []
         try:
             for sheet in workbook:
                 # Аналитические выводы и «Регион для поиска» не являются входными данными.
                 if "100 записей" in workbook.sheetnames and sheet.title != "100 записей":
                     skipped.append(sheet.title)
                     continue
-                found = read_sheet(sheet, path.name, source_id, should_cancel)
+                found, info = read_sheet(sheet, path.name, source_id, should_cancel)
                 if found is None:
                     skipped.append(sheet.title)
+                    diagnostics.append(info)
                     continue
                 records.extend(found)
                 count += len(found)
         finally:
             workbook.close()
+            
         if not count:
-            raise ValueError(f"{path.name}: нет строк с распознаваемой структурой")
+            if diagnostics:
+                # Берем первый лист с диагностикой для понятного сообщения.
+                info = diagnostics[0]
+                raise ValueError(_missing_message(path.name, info["sheet"], info["seen"], info["header"]))
+            raise ValueError(f"{path.name}: заголовки найдены, но нет строк с данными")
+            
         sources.append({"file": path.name, "source_id": source_id, "sha256": digest,
                         "rows": count, "skipped_sheets": skipped})
     return records, sources
@@ -77,27 +112,40 @@ def read_records(paths, should_cancel=None):
 def read_sheet(sheet, filename, source_id, should_cancel=None):
     mapping = None
     records = []
+    seen = {}
+    header_found = False
+    
     for row_number, cells in enumerate(sheet.iter_rows(), 1):
         if should_cancel and row_number % 100 == 1:
             should_cancel()
         values = [cell.value for cell in cells]
+        
         if mapping is None:
             if row_number > 30:
-                return None
+                return None, {"sheet": sheet.title, "seen": seen, "header": header_found}
+                
             headers = [normalize(value) for value in values]
             candidate = {}
             for field, aliases in ALIASES.items():
                 indices = [i for i, header in enumerate(headers)
                            if header in {normalize(alias) for alias in aliases}]
                 if len(indices) > 1:
-                    raise ValueError(f"{filename}/{sheet.title}: дубли колонок {field}")
+                    raise ValueError(
+                        f"{filename}/«{sheet.title}»: дубли колонок "
+                        f"«{REQUIRED_LABELS.get(field, field)}»"
+                    )
                 if indices:
                     candidate[field] = indices[0]
+                    seen[field] = values[indices[0]]
+                    
             if "name" in candidate and ("education" in candidate or "document" in candidate):
                 mapping = candidate
+                header_found = True
             continue
+            
         if all(value is None or text(value) == "" for value in values):
             continue
+            
         record = {field: text(values[index]) for field, index in mapping.items()}
         record["name"] = "" if values[mapping["name"]] is None else str(values[mapping["name"]])
         record["personal_file_number"] = (
@@ -106,11 +154,17 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
         )
         if "postal_code_raw" in mapping:
             record["postal_code_raw"] = personal_file_number(cells[mapping["postal_code_raw"]])
+            
         formula_fields = [field for field, index in mapping.items() if cells[index].data_type == "f"]
         for field in formula_fields:
             record[field] = ""
+            
         record.update({"record_id": f"{source_id}:{sheet.title}:{row_number}",
                        "source_file": filename, "source_sheet": sheet.title,
                        "source_row": row_number, "formula_fields": formula_fields})
         records.append(record)
-    return records if mapping is not None else None
+        
+    if mapping is None:
+        return None, {"sheet": sheet.title, "seen": seen, "header": header_found}
+    return records, {"sheet": sheet.title, "seen": seen, "header": header_found}
+
