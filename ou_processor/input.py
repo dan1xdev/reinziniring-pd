@@ -1,6 +1,7 @@
 """Чтение двух предоставленных форматов без использования аналитической разметки."""
 
 import hashlib
+import datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -62,6 +63,27 @@ def _missing_message(filename, sheet, seen, header_found):
     if missing:
         parts.append("не найдены обязательные колонки: " + "; ".join(missing) + ".")
     return " ".join(parts)
+
+
+def _check_damaged_cell(cell, value):
+    flags = []
+    if value is None:
+        return flags
+    
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
+        
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if abs(value) > 10000:
+            flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
+            
+    elif isinstance(value, str) and ("E+" in value or "e+" in value):
+        flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
+        
+    elif cell.number_format and any(char in cell.number_format.upper() for char in ("Y", "M", "D", "H")):
+        flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
+        
+    return flags
 
 
 def dedupe_personal_files(records, sources):
@@ -129,7 +151,6 @@ def read_records(paths, should_cancel=None, sheet_name=None):
         
         try:
             for sheet in workbook:
-                # Выбор конкретного листа или пропуск служебных
                 if sheet_name:
                     if sheet.title != sheet_name:
                         skipped.append(sheet.title)
@@ -164,7 +185,6 @@ def read_records(paths, should_cancel=None, sheet_name=None):
 
         if not count:
             if diagnostics:
-                # Берем первый лист с диагностикой для понятного сообщения.
                 info = diagnostics[0]
                 raise ValueError(_missing_message(path.name, info["sheet"], info["seen"], info["header"]))
             raise ValueError(f"{path.name}: заголовки найдены, но нет строк с данными")
@@ -214,7 +234,16 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
         if all(value is None or text(value) == "" for value in values):
             continue
             
-        record = {field: text(values[index]) for field, index in mapping.items()}
+        # Очищаем целочисленные float (например, 2020.0 -> "2020")
+        cleaned_values = {}
+        for field, index in mapping.items():
+            val = values[index]
+            if isinstance(val, float) and val == int(val):
+                cleaned_values[field] = str(int(val))
+            else:
+                cleaned_values[field] = val
+
+        record = {field: text(val) for field, val in cleaned_values.items()}
         record["name"] = "" if values[mapping["name"]] is None else str(values[mapping["name"]])
         record["personal_file_number"] = (
             personal_file_number(cells[mapping["personal_file_number"]])
@@ -226,10 +255,16 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
         formula_fields = [field for field, index in mapping.items() if cells[index].data_type == "f"]
         for field in formula_fields:
             record[field] = ""
+
+        # Проверяем ячейки на повреждение Excel
+        input_flags = []
+        for index in mapping.values():
+            input_flags.extend(_check_damaged_cell(cells[index], cells[index].value))
             
         record.update({"record_id": f"{source_id}:{sheet.title}:{row_number}",
                        "source_file": filename, "source_sheet": sheet.title,
-                       "source_row": row_number, "formula_fields": formula_fields})
+                       "source_row": row_number, "formula_fields": formula_fields,
+                       "input_flags": input_flags})
         records.append(record)
         
     if mapping is None:

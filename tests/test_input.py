@@ -172,5 +172,42 @@ class SheetSelectionTests(unittest.TestCase):
         self.assertIn("Лист рабочий (копия)", sources[0]["skipped_sheets"])
 
 
+class DamagedCodeTests(unittest.TestCase):
+    def read_cell(self, value, number_format="General"):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "Данные"
+            sheet.append(["ФИО", "Образовательное учреждение", "Вид образования", "Год завершения"])
+            sheet.append(["Иванов", "Школа 1", "Среднее общее", value])
+            sheet["D2"].number_format = number_format
+            book.save(path)
+            return read_records([path])
+
+    def test_integer_float_is_clean_year(self):
+        records, _ = self.read_cell(2020.0)
+        self.assertEqual(records[0]["year"], "2020")
+        self.assertNotIn("ПОВРЕЖДЁН_КОД_EXCEL", records[0].get("input_flags", []))
+
+    def test_date_is_flagged(self):
+        import datetime
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "Данные"
+            sheet.append(["ФИО", "Образовательное учреждение", "Вид образования", "Год завершения"])
+            sheet.append(["Иванов", "Школа 1", "Среднее общее", datetime.datetime(2026, 3, 12)])
+            sheet["D2"].number_format = "DD.MM.YYYY" 
+            book.save(path)
+            records, _ = read_records([path])
+        self.assertIn("ПОВРЕЖДЁН_КОД_EXCEL", records[0]["input_flags"])
+
+    def test_scientific_notation_is_flagged(self):
+        records, _ = self.read_cell(1.5e10)
+        self.assertIn("ПОВРЕЖДЁН_КОД_EXCEL", records[0]["input_flags"])
+
+
 if __name__ == "__main__":
     unittest.main()
