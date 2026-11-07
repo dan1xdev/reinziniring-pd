@@ -122,6 +122,55 @@ class DuplicateTests(unittest.TestCase):
         self.assertTrue(records[0]["input_conflict"])
         self.assertTrue(records[1]["input_conflict"])
 
+class SheetSelectionTests(unittest.TestCase):
+    def read_multi(self, sheets, **kwargs):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            book = Workbook()
+            book.remove(book.active)
+            for title, rows in sheets:
+                sheet = book.create_sheet(title)
+                for row in rows:
+                    sheet.append(row)
+            book.save(path)
+            return read_records([path], **kwargs)
+
+    def test_service_lists_ignored_by_default(self):
+        header = ["ФИО", "Образовательное учреждение", "Вид образования"]
+        sheets = [
+            ("Данные", [header, ["Иванов", "Школа 1", "Среднее общее"]]),
+            ("ВУЗы", [header, ["Петров", "Вуз 1", "Высшее"]]),
+            ("Не нашли", [header, ["Сидоров", "Школа 2", "Среднее общее"]]),
+            ("Коллективу (1 чел)", [header, ["Смирнов", "Школа 3", "Среднее общее"]])
+        ]
+        records, sources = self.read_multi(sheets)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["student_name"], "Иванов")
+        self.assertIn("ВУЗы", sources[0]["skipped_sheets"])
+        self.assertIn("Не нашли", sources[0]["skipped_sheets"])
+        self.assertIn("Коллективу (1 чел)", sources[0]["skipped_sheets"])
+
+    def test_explicit_sheet_selection(self):
+        header = ["ФИО", "Образовательное учреждение", "Вид образования"]
+        sheets = [
+            ("Лист А", [header, ["Иванов", "Школа 1", "Среднее общее"]]),
+            ("Лист Б", [header, ["Петров", "Школа 2", "Среднее общее"]])
+        ]
+        records, sources = self.read_multi(sheets, sheet_name="Лист Б")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["student_name"], "Петров")
+        self.assertIn("Лист А", sources[0]["skipped_sheets"])
+
+    def test_copy_of_working_sheet_ignored(self):
+        header = ["ФИО", "Образовательное учреждение", "Вид образования"]
+        sheets = [
+            ("Лист рабочий", [header, ["Иванов", "Школа 1", "Среднее общее"]]),
+            ("Лист рабочий (копия)", [header, ["Петров", "Школа 1", "Среднее общее"]])
+        ]
+        records, sources = self.read_multi(sheets)
+        self.assertEqual(len(records), 1)
+        self.assertIn("Лист рабочий (копия)", sources[0]["skipped_sheets"])
+
 
 if __name__ == "__main__":
     unittest.main()

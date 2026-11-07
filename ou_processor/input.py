@@ -25,7 +25,6 @@ ALIASES = {
     "postal_code_raw": ["Индекс", "Почтовый индекс"],
 }
 
-# Обязательные поля: имя файла всегда; вид образования - либо колонка, либо документ.
 REQUIRED_GROUPS = [("name",), ("education", "document")]
 
 REQUIRED_LABELS = {
@@ -34,6 +33,9 @@ REQUIRED_LABELS = {
     "document": "Тип документа об образовании",
     "student_name": "ФИО",
 }
+
+SERVICE_SHEETS = ["ВУЗы", "Не нашли"]
+
 
 def personal_file_number(cell):
     # Сохраняем ведущие нули, в том числе заданные простым числовым форматом Excel.
@@ -46,13 +48,12 @@ def personal_file_number(cell):
 
 
 def _missing_message(filename, sheet, seen, header_found):
-    # Меняем эту строку: теперь мы берем все найденные колонки, у которых есть русская метка
     found = [REQUIRED_LABELS[f] for f in seen if f in REQUIRED_LABELS]
-    
     missing = []
     for group in REQUIRED_GROUPS:
         if not any(f in seen for f in group):
             missing.append(" или ".join(f"«{REQUIRED_LABELS[f]}»" for f in group))
+            
     parts = [f"{filename}/«{sheet}»:"]
     if not header_found:
         parts.append("не найдена строка заголовков.")
@@ -62,7 +63,9 @@ def _missing_message(filename, sheet, seen, header_found):
         parts.append("не найдены обязательные колонки: " + "; ".join(missing) + ".")
     return " ".join(parts)
 
+
 def dedupe_personal_files(records, sources):
+    # Удаляет полные повторы, а конфликты помечает флагом input_conflict
     by_number = {}
     unique_records = []
     removed_count = 0
@@ -81,10 +84,10 @@ def dedupe_personal_files(records, sources):
         else:
             existing = by_number[num]
             is_exact_duplicate = (
-                    r.get("student_name") == existing.get("student_name") and
-                    r.get("name") == existing.get("name") and
-                    r.get("education") == existing.get("education") and
-                    r.get("document") == existing.get("document")
+                r.get("student_name") == existing.get("student_name") and
+                r.get("name") == existing.get("name") and
+                r.get("education") == existing.get("education") and
+                r.get("document") == existing.get("document")
             )
 
             if is_exact_duplicate:
@@ -100,9 +103,10 @@ def dedupe_personal_files(records, sources):
     return unique_records
 
 
-def read_records(paths, should_cancel=None):
+def read_records(paths, should_cancel=None, sheet_name=None):
     records, sources = [], []
     seen_paths = set()
+    
     for filename in paths:
         if should_cancel:
             should_cancel()
@@ -110,20 +114,40 @@ def read_records(paths, should_cancel=None):
         if path in seen_paths:
             continue
         seen_paths.add(path)
+        
         if path.suffix.lower() != ".xlsx":
             raise ValueError(f"Поддерживается .xlsx: {path.name}")
+            
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         source_id = hashlib.sha256(str(path).encode()).hexdigest()[:8]
         workbook = load_workbook(path, read_only=True, data_only=False)
+        
         count = 0
         skipped = []
         diagnostics = []
+        requested_sheet_found = False
+        
         try:
             for sheet in workbook:
-                # Аналитические выводы и «Регион для поиска» не являются входными данными.
-                if "100 записей" in workbook.sheetnames and sheet.title != "100 записей":
-                    skipped.append(sheet.title)
-                    continue
+                # Выбор конкретного листа или пропуск служебных
+                if sheet_name:
+                    if sheet.title != sheet_name:
+                        skipped.append(sheet.title)
+                        continue
+                    requested_sheet_found = True
+                else:
+                    if "100 записей" in workbook.sheetnames and sheet.title != "100 записей":
+                        skipped.append(sheet.title)
+                        continue
+                    if sheet.title in SERVICE_SHEETS:
+                        skipped.append(sheet.title)
+                        continue
+                    
+                    title_lower = sheet.title.lower()
+                    if "копия" in title_lower or "коллективу" in title_lower:
+                        skipped.append(sheet.title)
+                        continue
+
                 found, info = read_sheet(sheet, path.name, source_id, should_cancel)
                 if found is None:
                     skipped.append(sheet.title)
@@ -134,6 +158,10 @@ def read_records(paths, should_cancel=None):
         finally:
             workbook.close()
             
+        if sheet_name and not requested_sheet_found:
+            available = ", ".join(f"«{s}»" for s in workbook.sheetnames)
+            raise ValueError(f"{path.name}: лист «{sheet_name}» не найден. Доступные листы: {available}")
+
         if not count:
             if diagnostics:
                 # Берем первый лист с диагностикой для понятного сообщения.
@@ -207,4 +235,3 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
     if mapping is None:
         return None, {"sheet": sheet.title, "seen": seen, "header": header_found}
     return records, {"sheet": sheet.title, "seen": seen, "header": header_found}
-
