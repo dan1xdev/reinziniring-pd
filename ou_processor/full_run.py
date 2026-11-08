@@ -2,7 +2,7 @@
 """Полный прогон и одна итоговая строка на ИНН."""
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import getpass
 import json
@@ -23,6 +23,7 @@ from .input import read_records
 from .normalization import normalize
 from .pipeline import process
 from .resolution import RegistrySearch, SearchCache, resolve
+from .source_fill import fill_source_copies
 
 
 def aggregate(result):
@@ -347,11 +348,142 @@ def aggregate(result):
     return result
 
 
+def _manual_review_rows(result):
+    rows = []
+
+    for item in result.get("review", []):
+        rows.append({
+            "kind": "Сопоставление",
+            "source_name": item.get("source_name", ""),
+            "inn": "",
+            "region": item.get("region", ""),
+            "city": item.get("city", ""),
+            "status": item.get("status", ""),
+            "reason": item.get("reason", ""),
+            "candidates": item.get("top_candidates", ""),
+            "official_name": "",
+            "genitive_name": "",
+            "address": "",
+            "postal_code": "",
+            "dadata_query": "",
+            "dadata_status": "",
+            "dadata_candidates": "",
+            "group_id": item.get("group_id", ""),
+            "record_ids": item.get("record_ids", ""),
+        })
+
+    for item in result.get("letters_review", []):
+        rows.append({
+            "kind": "Данные письма",
+            "source_name": item.get("official_name", ""),
+            "inn": item.get("inn", ""),
+            "region": "",
+            "city": "",
+            "status": item.get("status", "Проверить"),
+            "reason": item.get("checks", ""),
+            "candidates": "",
+            "official_name": item.get("official_name", ""),
+            "genitive_name": item.get("genitive_name", ""),
+            "address": item.get("address", ""),
+            "postal_code": item.get("postal_code", ""),
+            "dadata_query": "",
+            "dadata_status": "",
+            "dadata_candidates": "",
+            "group_id": "",
+            "record_ids": item.get("source_record_ids", ""),
+        })
+
+    for item in result.get("resolution", {}).get("requests", []):
+        if item.get("status") == "OK":
+            continue
+        rows.append({
+            "kind": "Проверка DaData",
+            "source_name": "",
+            "inn": "",
+            "region": "",
+            "city": "",
+            "status": "Требует внимания",
+            "reason": item.get("status", ""),
+            "candidates": "",
+            "official_name": "",
+            "genitive_name": "",
+            "address": "",
+            "postal_code": "",
+            "dadata_query": item.get("query", ""),
+            "dadata_status": item.get("status", ""),
+            "dadata_candidates": item.get("candidate_count", ""),
+            "group_id": item.get("group_id", ""),
+            "record_ids": "",
+        })
+
+    return rows
+
+
+def _extend_task6_summary(result, source_fill):
+    summary = result.setdefault("full_summary", {})
+    requests = result.get("resolution", {}).get("requests", [])
+    groups = result.get("resolution", {}).get("groups", [])
+    request_statuses = Counter(row.get("status", "НЕИЗВЕСТНО") for row in requests)
+    group_statuses = Counter(row.get("status", "НЕИЗВЕСТНО") for row in groups)
+    selection_statuses = Counter(
+        row.get("selection", "НЕИЗВЕСТНО") for row in result.get("records", [])
+    )
+    source_stats = result.get("sources", [])
+    duplicate_count = sum(int(row.get("duplicates_removed", 0) or 0) for row in source_stats)
+    field_labels = {
+        "official_name": "Название в именительном падеже",
+        "genitive_name": "Название в родительном падеже",
+        "address": "Адрес",
+        "postal_code": "Индекс",
+    }
+
+    summary["Дубли удалены до обработки"] = duplicate_count
+    summary["Исключено по правилам отбора"] = result.get("summary", {}).get("excluded_rows", 0)
+    summary["Строк требуют уточнения отбора"] = result.get("summary", {}).get("selection_review_rows", 0)
+    summary["Групп на ручную проверку сопоставления"] = len(result.get("review", []))
+    summary["Строк исходных книг для заполнения"] = source_fill.get("source_rows", 0)
+    summary["Создано копий исходных книг"] = source_fill.get("copy_count", 0)
+
+    for status, count in sorted(selection_statuses.items()):
+        summary[f"Отбор — {status}"] = count
+    for status, count in sorted(group_statuses.items()):
+        summary[f"Сопоставление — {status}"] = count
+
+    source_rows = int(source_fill.get("source_rows", 0) or 0)
+    present = source_fill.get("present", {})
+    written = source_fill.get("written", {})
+    for field, label in field_labels.items():
+        count = int(present.get(field, 0) or 0)
+        percent = round(100 * count / source_rows, 1) if source_rows else 0
+        summary[f"Заполнено в копиях — {label}"] = f"{count} из {source_rows} ({percent}%)"
+        summary[f"Записано новых значений — {label}"] = int(written.get(field, 0) or 0)
+
+    summary["DaData — записей запросов"] = len(requests)
+    summary["DaData — успешных запросов"] = request_statuses.get("OK", 0)
+    summary["DaData — не найдено"] = request_statuses.get("НЕ_НАЙДЕНО", 0)
+    summary["DaData — ошибок и пропусков"] = sum(
+        count for status, count in request_statuses.items()
+        if status not in {"OK", "НЕ_НАЙДЕНО"}
+    )
+    summary["DaData — реальных внешних обращений"] = result.get("resolution", {}).get("actual_requests", 0)
+    summary["DaData — запросов из кэша"] = sum(bool(row.get("cached")) for row in requests)
+    summary["DaData — кандидатов получено"] = len(result.get("resolution", {}).get("candidates", []))
+
+    for index, item in enumerate(source_fill.get("copies", []), 1):
+        summary[f"Копия исходного файла {index}"] = item.get("file", "")
+    if source_fill.get("errors"):
+        summary["Ошибки создания копий"] = "\n".join(source_fill["errors"])
+
+
 def save(result, output, overrides=None):
     prepare_letters(result, overrides=overrides)
 
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+
+    source_fill = fill_source_copies(result, output)
+    result["source_fill"] = source_fill
+    _extend_task6_summary(result, source_fill)
 
     book = Workbook()
     book.remove(book.active)
@@ -404,21 +536,49 @@ def save(result, output, overrides=None):
         ],
     )
 
+    all_letters = result["letters_ready"] + result["letters_review"]
     add_table(
         book,
-        "Письма к печати",
-        result["letters_ready"],
+        "Письма",
+        all_letters,
         LETTER_COLUMNS,
     )
 
-    add_table(
-        book,
-        "Письма проверить",
-        result["letters_review"],
-        LETTER_COLUMNS,
-    )
-
+    manual_rows = _manual_review_rows(result)
     review_sheet = add_table(
+        book,
+        "Ручная проверка",
+        manual_rows,
+        [
+            ("kind", "Тип проверки"),
+            ("source_name", "Исходное название"),
+            ("inn", "ИНН"),
+            ("region", "Регион"),
+            ("city", "Город"),
+            ("status", "Статус"),
+            ("reason", "Причина / что уточнить"),
+            ("candidates", "Кандидаты"),
+            ("official_name", "Название в именительном падеже"),
+            ("genitive_name", "Название в родительном падеже"),
+            ("address", "Адрес"),
+            ("postal_code", "Индекс"),
+            ("dadata_query", "Запрос DaData"),
+            ("dadata_status", "Статус DaData"),
+            ("dadata_candidates", "Кандидатов DaData"),
+            ("group_id", "Группа"),
+            ("record_ids", "Исходные записи"),
+        ],
+    )
+
+    review_sheet.column_dimensions["H"].width = 90
+    review_sheet.column_dimensions["G"].width = 55
+    review_sheet.column_dimensions["I"].width = 55
+    review_sheet.column_dimensions["J"].width = 55
+    review_sheet.column_dimensions["K"].width = 45
+    review_sheet.column_dimensions["M"].width = 45
+
+    # Старое имя листа оставлено для совместимости с существующими сценариями.
+    legacy_review = add_table(
         book,
         "Проверить",
         result["review"],
@@ -438,15 +598,7 @@ def save(result, output, overrides=None):
             ("record_ids", "Исходные записи"),
         ],
     )
-
-    review_sheet.column_dimensions["H"].width = 110
-
-    for row in range(2, review_sheet.max_row + 1):
-        review_sheet.row_dimensions[row].height = (
-            240
-            if result["review"][row - 2]["top_candidates"]
-            else 65
-        )
+    legacy_review.column_dimensions["H"].width = 110
 
     summary = [
         {"metric": key, "value": value}
@@ -500,6 +652,21 @@ def save(result, output, overrides=None):
             ),
         },
     ]
+
+    summary.extend([
+        {
+            "metric": "Копии исходных файлов",
+            "value": "Создаются в папке filled_sources рядом с schools.xlsx. Оригиналы не изменяются.",
+        },
+        {
+            "metric": "Правило заполнения",
+            "value": "Записываются только подтверждённые значения; пустые и конфликтные результаты не затирают исходные ячейки.",
+        },
+        {
+            "metric": "Проверки DaData",
+            "value": "Ошибки и пропуски вынесены на лист «Ручная проверка»; полный журнал запросов находится на листе «Запросы DaData».",
+        },
+    ])
 
     add_table(
         book,

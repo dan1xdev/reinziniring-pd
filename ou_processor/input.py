@@ -105,10 +105,24 @@ def dedupe_personal_files(records, sources):
             continue
             
         variants = by_number.setdefault(num, [])
-        if any(all(r.get(field) == existing.get(field) for field in fields) for existing in variants):
+        duplicate_of = next(
+            (existing for existing in variants
+             if all(r.get(field) == existing.get(field) for field in fields)),
+            None,
+        )
+        if duplicate_of is not None:
             source = sources_by_id.get(r["record_id"].partition(":")[0])
             if source is not None:
                 source["duplicates_removed"] += 1
+            duplicate_of.setdefault("duplicate_source_rows", []).append({
+                "source_id": r.get("source_id", ""),
+                "source_file": r.get("source_file", ""),
+                "source_path": r.get("source_path", ""),
+                "source_sheet": r.get("source_sheet", ""),
+                "source_row": r.get("source_row", ""),
+                "header_row": r.get("header_row", ""),
+                "record_id": r.get("record_id", ""),
+            })
             continue
         if variants:
             r["input_conflict"] = True
@@ -164,7 +178,7 @@ def read_records(paths, should_cancel=None, sheet_name=None):
                         skipped.append(sheet.title)
                         continue
 
-                found, info = read_sheet(sheet, path.name, source_id, should_cancel)
+                found, info = read_sheet(sheet, path.name, source_id, should_cancel, source_path=str(path))
                 if found is None:
                     skipped.append(sheet.title)
                     diagnostics.append(info)
@@ -184,19 +198,20 @@ def read_records(paths, should_cancel=None, sheet_name=None):
                 raise ValueError(_missing_message(path.name, info["sheet"], info["seen"], info["header"]))
             raise ValueError(f"{path.name}: заголовки найдены, но нет строк с данными")
             
-        sources.append({"file": path.name, "source_id": source_id, "sha256": digest,
-                        "rows": count, "skipped_sheets": skipped})
+        sources.append({"file": path.name, "source_id": source_id, "path": str(path), "sha256": digest,
+                        "rows": count, "skipped_sheets": skipped, "duplicates_removed": 0})
 
     records = dedupe_personal_files(records, sources)
 
     return records, sources
 
 
-def read_sheet(sheet, filename, source_id, should_cancel=None):
+def read_sheet(sheet, filename, source_id, should_cancel=None, source_path=""):
     mapping = None
     records = []
     seen = {}
     header_found = False
+    header_row_number = None
     
     for row_number, cells in enumerate(sheet.iter_rows(), 1):
         if should_cancel and row_number % 100 == 1:
@@ -224,6 +239,7 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
             if "name" in candidate and ("education" in candidate or "document" in candidate):
                 mapping = candidate
                 header_found = True
+                header_row_number = row_number
             continue
             
         if all(value is None or text(value) == "" for value in values):
@@ -265,8 +281,9 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
 
             
         record.update({"record_id": f"{source_id}:{sheet.title}:{row_number}",
-                       "source_file": filename, "source_sheet": sheet.title,
-                       "source_row": row_number, "formula_fields": formula_fields,
+                       "source_id": source_id, "source_file": filename, "source_path": source_path,
+                       "source_sheet": sheet.title, "source_row": row_number,
+                       "header_row": header_row_number, "formula_fields": formula_fields,
                        "input_flags": input_flags, "damaged_fields": damaged_fields})
         records.append(record)
         

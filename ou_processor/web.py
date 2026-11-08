@@ -237,7 +237,18 @@ class Application:
             if offline:
                 warnings.append('Использованы только сохранённые ответы DaData. Новых запросов не было.')
             if reserve is None:
-                warnings.append('Резервный реестр недоступен. Ненайденные учреждения сохранены на листе «Проверить».')
+                warnings.append('Резервный реестр недоступен. Ненайденные учреждения сохранены на листе «Ручная проверка».')
+            source_fill = result.get('source_fill', {})
+            if source_fill.get('copy_count'):
+                warnings.append(
+                    f"Созданы заполненные копии исходных книг: {source_fill['copy_count']}. "
+                    f"Они сохранены в ui_runs/{job_id}/result/filled_sources; оригиналы не изменены."
+                )
+            if source_fill.get('errors'):
+                warnings.append(
+                    'Не все копии исходных книг удалось заполнить: '
+                    + '; '.join(source_fill['errors'])
+                )
             missing = summary['Строк без данных ученика']
             if missing:
                 warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')

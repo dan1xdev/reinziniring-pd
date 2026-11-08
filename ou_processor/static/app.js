@@ -153,7 +153,7 @@ function renderResult(job) {
   }
   $('warnings').replaceChildren();
   const warnings = [...job.warnings];
-  if (job.summary.review) warnings.push('Неоднозначные записи сохранены отдельно. Посмотрите лист «Проверить» и причины отбора на листе «Исходные записи».');
+  if (job.summary.review) warnings.push('Неоднозначные записи сохранены отдельно. Посмотрите лист «Ручная проверка» и причины отбора на листе «Исходные записи».');
   if (job.summary.excluded) warnings.push(`Исключено по правилам отбора: ${job.summary.excluded}. Причины сохранены на листе «Исходные записи».`);
   for (const warning of warnings) { const p = document.createElement('p'); p.className = 'notice'; p.textContent = warning; $('warnings').append(p); }
   $('preview').replaceChildren();
