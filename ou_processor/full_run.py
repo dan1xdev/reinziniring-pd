@@ -185,8 +185,8 @@ def main():
     if args.online and not token:
         parser.error('Нужен DADATA_API_KEY или --ask-token')
     api = SearchCache(args.cache,DaDataClient(token) if args.online else None)
-    registry = RegistrySearch(args.registry)
-    resolve(result,api,registry)
+    registry = RegistrySearch(args.registry, config=config)
+    resolve(result,api,registry,config=config)
     aggregate(result)
     save(result,args.output)
     print(json.dumps(result['full_summary'],ensure_ascii=False,indent=2))

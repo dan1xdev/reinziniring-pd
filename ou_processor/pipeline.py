@@ -115,11 +115,10 @@ def process(records, config):
         record["personal_file_number"] = text(record.get("personal_file_number"))
         kind, source, conflict = education_kind(record, config)
         record.update({"education_kind": kind, "education_source": source,
-                       "normalized_name": normalize(name), "search_variant": expanded_key(name),
-                       "institution_type": institution_type(name), "numbers": list(numbers(name))})
+                       "normalized_name": normalize(name), "search_variant": expanded_key(name, config=config),
+                       "institution_type": institution_type(name, config=config), "numbers": list(numbers(name))})
         record.update(extract_geography(record, config))
-        
-        flags = list(record.pop("geo_flags")) + abbreviation_flags(name)
+        flags = list(record.pop("geo_flags")) + abbreviation_flags(name, config=config)
         flags.extend(record.get("input_flags", []))
         
         # --- ОПРЕДЕЛЕНИЕ СТРАНЫ ---
@@ -220,7 +219,8 @@ def group_records(records):
             continue
         key = (record["normalized_name"], record["region"], record["city"])
         isolate = not record["region"] or not record["city"] or any(
-            flag in record["flags"] for flag in ["КОНФЛИКТ_РЕГИОНА", "КОНФЛИКТ_ГОРОДА", "ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ"])
+            flag in record["flags"] for flag in ["КОНФЛИКТ_РЕГИОНА", "КОНФЛИКТ_ГОРОДА",
+                                                "ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ", "СТАРЫЙ_ВЫПУСК"])
         if isolate:
             key += (record["record_id"],)
         buckets[key].append(record)
@@ -277,10 +277,12 @@ def possible_matches(groups, records, config):
 
 def comparison_key(record, config):
     key = record["search_variant"]
-    removals = [phrase for phrase in ABBREVIATIONS.values() if "учреждение" in phrase]
+    # Удаление формы и географии допустимо только в очереди кандидатов.
+    abbr_map = config.get("abbreviations", ABBREVIATIONS)
+    removals = [phrase for phrase in abbr_map.values() if "учреждение" in phrase]
     city = record["city"]
-    if city in config["cities"]:
-        removals += [normalize(alias) for alias in [city, *config["cities"][city]["explicit_aliases"]]]
+    if city in config.get("cities", {}):
+        removals += [normalize(alias) for alias in [city, *config["cities"][city].get("explicit_aliases", [])]]
     for phrase in sorted(removals, key=len, reverse=True):
         key = re.sub(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", " ", key)
     key = key.replace("средняя общеобразовательная школа", "школа")

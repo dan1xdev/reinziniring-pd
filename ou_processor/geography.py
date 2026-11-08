@@ -1,4 +1,4 @@
-"""Консервативная география: явные названия и небольшой расширяемый словарь."""
+"""Консервативная география: явные названия и расширяемый справочник регионов и городов."""
 
 import re
 
@@ -13,32 +13,48 @@ def matches(value, entries):
 
 def extract_geography(record, config):
     region_evidence, city_evidence = [], []
-    regions = config["regions"]
-    cities = config["cities"]
-    for field, source in [("region_raw", "поле"), ("location_raw", "местонахождение"),
-                          ("name", "название")]:
+    regions = config.get("regions", {})
+    cities = config.get("cities", {})
+
+    fields_to_check = [
+        ("region_raw", "поле"),
+        ("location_raw", "местонахождение"),
+        ("school_address_raw", "адрес"),
+        ("name", "название")
+    ]
+
+    for field, source in fields_to_check:
         raw = record.get(field, "")
+        if not raw:
+            continue
         for region in sorted(matches(raw, regions)):
             region_evidence.append({"value": region, "source": source})
         for city, details in cities.items():
-            # В названии ищем явный город, а не прилагательное «Московский».
-            aliases = details["explicit_aliases"]
-            if field != "name":
-                aliases = [*aliases, city]
-            if matches(raw, {city: aliases}) and (
+            # В названии и адресе ищем явный город, а не случайное прилагательное
+            aliases = details.get("explicit_aliases", [])
+            all_aliases = [city, *aliases] if field != "name" else aliases
+            if matches(raw, {city: all_aliases}) and (
                 field != "name" or any(re.search(pattern, normalize(raw))
-                                       for pattern in details["name_patterns"])
+                                       for pattern in details.get("name_patterns", []))
             ):
                 city_evidence.append({"value": city, "source": source})
-                region_evidence.append({"value": details["region"],
-                                        "source": source + ":город из словаря"})
+                if details.get("region"):
+                    region_evidence.append({"value": details["region"],
+                                            "source": source + ":город из словаря"})
+
     explicit_city = text(record.get("city_raw"))
     if explicit_city:
-        matched = matches(explicit_city, {city: data["explicit_aliases"] for city, data in cities.items()})
-        city_evidence.append({"value": next(iter(matched)) if len(matched) == 1 else normalize(explicit_city),
-                              "source": "поле"})
+        matched = matches(explicit_city, {city: [city, *data.get("explicit_aliases", [])]
+                                          for city, data in cities.items()})
         if len(matched) == 1:
-            region_evidence.append({"value": cities[next(iter(matched))]["region"], "source": "поле:город из словаря"})
+            matched_city = next(iter(matched))
+            city_evidence.append({"value": matched_city, "source": "поле"})
+            if cities[matched_city].get("region"):
+                region_evidence.append({"value": cities[matched_city]["region"],
+                                        "source": "поле:город из словаря"})
+        else:
+            city_evidence.append({"value": normalize(explicit_city), "source": "поле"})
+
     region_values = {item["value"] for item in region_evidence}
     city_values = {item["value"] for item in city_evidence}
     flags = []
@@ -46,11 +62,18 @@ def extract_geography(record, config):
         flags.append("КОНФЛИКТ_РЕГИОНА")
     if len(city_values) > 1:
         flags.append("КОНФЛИКТ_ГОРОДА")
+
     region = next(iter(region_values)) if len(region_values) == 1 else ""
     city = next(iter(city_values)) if len(city_values) == 1 else ""
     if not region:
         flags.append("РЕГИОН_НЕ_ОПРЕДЕЛЕН")
     if not city:
         flags.append("ГОРОД_НЕ_ОПРЕДЕЛЕН")
-    return {"region": region, "city": city, "region_evidence": region_evidence,
-            "city_evidence": city_evidence, "geo_flags": flags}
+
+    return {
+        "region": region,
+        "city": city,
+        "region_evidence": region_evidence,
+        "city_evidence": city_evidence,
+        "geo_flags": flags
+    }
