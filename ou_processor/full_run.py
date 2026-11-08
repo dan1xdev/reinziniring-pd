@@ -685,10 +685,10 @@ def main():
         DaDataClient(token) if args.online else None,
     )
 
-    registry = RegistrySearch(args.registry)
+    registry = RegistrySearch(args.registry, config=config)
 
     try:
-        resolve(result, api, registry)
+        resolve(result, api, registry, config=config)
         aggregate(result)
         save(result, args.output)
     finally:
