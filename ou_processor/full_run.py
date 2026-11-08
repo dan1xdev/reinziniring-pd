@@ -10,6 +10,7 @@ import re
 from openpyxl import Workbook
 from .dadata import DaDataClient
 from .export import add_table, RECORD_COLUMNS
+from .letters import prepare_letters, LETTER_COLUMNS
 from .input import read_records
 from .normalization import normalize
 from .pipeline import process
@@ -109,8 +110,13 @@ def aggregate(result):
     }
     return result
 
-
 def save(result, output):
+    prepare_letters(result)
+
+    output.mkdir(parents=True, exist_ok=True)
+    (output / 'result.json').write_text(
+        json.dumps(result, ensure_ascii=False, indent=2)
+    )
     output.mkdir(parents=True, exist_ok=True)
     (output / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
     book = Workbook()
@@ -125,6 +131,19 @@ def save(result, output):
         main.column_dimensions[col].width = width
     add_table(book, 'Ученики и дела', result['students'], [('school_name','Школа / учреждение'),
         ('address','Адрес'),('student','ФИО ученика'),('file','Номер личного дела'),('inn','ИНН'),('record_ids','Исходные записи')])
+    add_table(
+    book,
+    "Письма к печати",
+    result["letters_ready"],
+    LETTER_COLUMNS,
+    )
+
+    add_table(
+    book,
+    "Письма проверить",
+    result["letters_review"],
+    LETTER_COLUMNS,
+    )
     review_sheet = add_table(book, 'Проверить', result['review'], [('source_name','Исходное название'),('region','Регион'),
         ('city','Город'),('status','Статус'),('students','ФИО'),('files','Номер дела'),('reason','Что уточнить'),
         ('top_candidates','Первые три кандидата'),('candidate_count','Кандидатов'),('registry_used','Проверен реестр'),('registry_truncated','Выдача ограничена'),
