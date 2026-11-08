@@ -244,18 +244,29 @@ def official_typography(value):
     return name, adjusted
 
 
-_ADJECTIVE_ENDINGS = [
-    ("ский", "ского"),
-    ("цкий", "цкого"),
-    ("кий", "кого"),
-    ("ое", "ого"),
-    ("ее", "его"),
-    ("ая", "ой"),
-    ("яя", "ей"),
-    ("ый", "ого"),
-    ("ий", "его"),
-    ("ой", "ого"),
-]
+# Совпадение окончания не подтверждает склонение: например, «хорошая» → «хорошей».
+# Автоматически используем только проверенные формы типовых названий.
+_GENITIVE_ADJECTIVES = {
+    "муниципальное": "муниципального",
+    "государственное": "государственного",
+    "федеральное": "федерального",
+    "бюджетное": "бюджетного",
+    "автономное": "автономного",
+    "казенное": "казенного",
+    "казённое": "казённого",
+    "частное": "частного",
+    "негосударственное": "негосударственного",
+    "образовательное": "образовательного",
+    "общеобразовательное": "общеобразовательного",
+    "профессиональное": "профессионального",
+    "дошкольное": "дошкольного",
+    "средняя": "средней",
+    "основная": "основной",
+    "начальная": "начальной",
+    "общеобразовательная": "общеобразовательной",
+    "специальная": "специальной",
+    "коррекционная": "коррекционной",
+}
 
 _NOUNS = {
     "учреждение": "учреждения",
@@ -300,21 +311,10 @@ def genitive_official_name(name):
         if word.isupper():
             return "", False
 
-        ending = next(
-            (
-                (old, new)
-                for old, new in _ADJECTIVE_ENDINGS
-                if word.casefold().endswith(old)
-                and len(word) > len(old) + 2
-            ),
-            None,
-        )
+        changed = _GENITIVE_ADJECTIVES.get(word.casefold())
 
-        if ending is None:
+        if changed is None:
             return "", False
-
-        old, new = ending
-        changed = word[:-len(old)] + new
 
         if word[0].isupper():
             changed = changed[0].upper() + changed[1:]
@@ -364,6 +364,7 @@ def _person_ok(name):
 
 def _students(students):
     names = defaultdict(set)
+    names_per_file = defaultdict(set)
     records = set()
     notes = []
 
@@ -385,8 +386,14 @@ def _students(students):
 
         names[full].add(personal_file)
 
+        if personal_file:
+            names_per_file[personal_file].add(_normalized(full))
+
     if not names:
         notes.append("Нет сведений о поступивших")
+
+    if any(len(file_names) > 1 for file_names in names_per_file.values()):
+        notes.append("Один номер дела связан с разными ФИО")
 
     if any(
         len(files - {""}) > 1
@@ -567,7 +574,8 @@ def _prepare_one(inn, groups, students, override=None):
         if len(people) == 1:
             fragment = (
                 f"Благодарим коллектив {genitive} "
-                f"за подготовку поступившего {people[0]}."
+                "за подготовку к поступлению.\n"
+                f"ФИО: {people[0]}."
             )
         else:
             fragment = (
