@@ -40,6 +40,7 @@ RUSSIAN_ADDR_RE = re.compile(
     r"|(?<!\w)(?:крым|симферополь|донецк|луганск|херсон|мелитополь)(?!\w)")
 
 TEXT_FIELDS = ("name", "school_address_raw", "location_raw", "city_raw", "region_raw")
+EXPLICIT_FOREIGN_COUNTRIES = {"германия", "китай"}
 
 
 def valid_inn(s):
@@ -71,7 +72,10 @@ def classify_country(record):
 
     blob = " ".join(str(record.get(k) or "") for k in TEXT_FIELDS).lower().replace("ё", "е")
 
-    foreign_hits = sorted(set(FOREIGN_RE.findall(blob)))
+    # Дополнительные страны распознаём как отдельную часть географии, не как имя школы или улицы.
+    address_parts = {normalize(part) for field in TEXT_FIELDS if field != "name"
+                     for part in re.split(r"[,;\n]", str(record.get(field) or ""))}
+    foreign_hits = sorted(set(FOREIGN_RE.findall(blob)) | (address_parts & EXPLICIT_FOREIGN_COUNTRIES))
 
     postal = re.sub(r"\D", "", str(record.get("postal_code_raw") or ""))
     if len(postal) == 6 and postal[0] in "0789":
@@ -116,6 +120,7 @@ def process(records, config):
         record.update(extract_geography(record, config))
         
         flags = list(record.pop("geo_flags")) + abbreviation_flags(name)
+        flags.extend(record.get("input_flags", []))
         
         # --- ОПРЕДЕЛЕНИЕ СТРАНЫ ---
         country_label, country_flags = classify_country(record)
@@ -156,6 +161,8 @@ def process(records, config):
             selection, reason = "ПРОВЕРИТЬ_ОТБОР", "Конфликт страны"
         elif record.get("input_conflict"):
             selection, reason = "ПРОВЕРИТЬ_ОТБОР", "Один номер личного дела у разных записей"
+        elif "year" in record.get("damaged_fields", []):
+            selection, reason = "ПРОВЕРИТЬ_ОТБОР", "Повреждён год завершения в Excel"
         elif kind not in config["allowed_education"] or conflict or not name or record["formula_fields"]:
             selection, reason = "ПРОВЕРИТЬ_ОТБОР", "Не хватает данных или есть противоречие"
         else:

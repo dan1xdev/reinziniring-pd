@@ -144,7 +144,7 @@ def assess(record, candidate):
             reasons.append(field.upper() + '_НЕ_СОВПАЛ')
     if any('КОНФЛИКТ' in f for f in record['flags']):
         reasons.append('ПРОТИВОРЕЧИЕ_В_ИСТОЧНИКЕ')
-    if 'ВОЗМОЖНОЕ_ПОДРАЗДЕЛЕНИЕ_ВУЗА' in record['flags']:
+    if {'ВОЗМОЖНОЕ_ПОДРАЗДЕЛЕНИЕ_ВУЗА', 'ПОДРАЗДЕЛЕНИЕ_ВУЗА'} & set(record['flags']):
         reasons.append('ПОДРАЗДЕЛЕНИЕ_ВУЗА_ТРЕБУЕТ_ПРОВЕРКИ')
     key = meaningful(record)
     target = terms(combined)
