@@ -60,6 +60,45 @@ class ResolutionTests(unittest.TestCase):
             self.assertEqual(cache.entries,{})
             self.assertEqual(cache.requests[0]['status'],'ОШИБКА_СЕТИ')
 
+    # Реестр лицензий - источник по умолчанию: при найденном совпадении DaData не вызывается.
+    def test_license_registry_is_primary_source(self):
+        calls = []
+        class API:
+            actual_requests = 0
+            requests = []
+            def search(self, *args):
+                calls.append(args)
+                return [candidate()]
+        class Licenses:
+            metadata = {}
+            def search(self, record):
+                return [{**candidate(), 'source': 'Реестр лицензий'}], False
+        result = {'records': [record(record_id='1')],
+                  'groups': [dict(group_id='g', record_ids=['1'])]}
+        resolve(result, API(), None, progress=False, licenses=Licenses())
+        self.assertEqual(calls, [])
+        self.assertTrue(result['resolution']['groups'][0]['license_used'])
+        self.assertFalse(result['resolution']['groups'][0]['registry_used'])
+        self.assertEqual(result['resolution']['groups'][0]['selected']['source'], 'Реестр лицензий')
+
+    # Если в реестре лицензий совпадения нет, подключается DaData.
+    def test_license_miss_falls_back_to_dadata(self):
+        class API:
+            actual_requests = 1
+            requests = []
+            def search(self, *args):
+                return [candidate()]
+        class Licenses:
+            metadata = {}
+            def search(self, record):
+                return [], False
+        result = {'records': [record(record_id='1')],
+                  'groups': [dict(group_id='g', record_ids=['1'])]}
+        resolve(result, API(), None, progress=False, licenses=Licenses())
+        group = result['resolution']['groups'][0]
+        self.assertTrue(group['license_used'])
+        self.assertEqual(group['selected']['candidate_inn'], '123')
+
     def test_successful_primary_skips_registry(self):
         class API:
             actual_requests=1

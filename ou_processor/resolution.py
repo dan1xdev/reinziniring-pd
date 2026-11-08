@@ -1,4 +1,5 @@
-"""Полный поиск: DaData, затем резервный реестр; объединение только по ИНН."""
+"""Полный поиск: реестр лицензий (основной), затем DaData и резервный реестр;
+объединение только по ИНН."""
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -9,6 +10,8 @@ import sqlite3
 import time
 
 from .dadata import DaDataError, candidate_row
+from .license_registry import SOURCE_PAGE as LICENSE_SOURCE_PAGE
+from .license_registry import current_snapshot as current_license_snapshot
 from .normalization import expanded_key, institution_type, normalize, numbers
 from .registry import current_snapshot
 
@@ -366,6 +369,59 @@ def choose(record, candidates, config=None):
     return selected, ranked
 
 
+class LicenseSearch:
+    """Поиск по локальному индексу реестра лицензий Рособрнадзора."""
+
+    def __init__(self, cache, config=None):
+        self.config = config or _DEFAULT_CONFIG
+        snapshot = current_license_snapshot(Path(cache))
+        if not snapshot:
+            raise ValueError('Нет скачанного реестра лицензий')
+        directory, self.metadata = snapshot
+        self.connection = sqlite3.connect(f'file:{directory / "index.sqlite"}?mode=ro', uri=True)
+        self.connection.row_factory = sqlite3.Row
+        self.cache = {}
+        self.regions = [row[0] for row in self.connection.execute('SELECT DISTINCT region FROM licenses') if row[0]]
+
+    def search(self, record):
+        significant = meaningful(record, self.config)
+        nums = school_numbers(record['name'])
+        tokens = [max(significant, key=lambda w: (len(w), w))] if significant else []
+        if nums:
+            tokens.append(nums[0])
+        if not tokens:
+            return [], False
+        region_options = [r for r in self.regions if geography_matches(record['region'], r)] if record['region'] else []
+        key = (tuple(tokens), tuple(region_options))
+        if key not in self.cache:
+            condition = ' AND '.join('instr(search_name, ?) > 0' for _ in tokens)
+            parameters = list(tokens)
+            if region_options:
+                condition += ' AND region IN (' + ','.join('?' for _ in region_options) + ')'
+                parameters += region_options
+            rows = self.connection.execute('SELECT DISTINCT inn, ogrn, full_name, short_name, license_number, '
+                'status, date_start, region, address FROM licenses WHERE ' + condition +
+                ' ORDER BY date_start DESC LIMIT 2001', parameters).fetchall()
+            self.cache[key] = [dict(row) for row in rows]
+        found = self.cache[key]
+        result = []
+        seen = set()
+        for r in found[:2000]:
+            duplicate = (r['inn'], r['full_name'], r['license_number'], r['status'])
+            if duplicate in seen:
+                continue
+            seen.add(duplicate)
+            active = 'действ' in (r['status'] or '').casefold()
+            result.append({'candidate_inn': r['inn'], 'candidate_ogrn': r['ogrn'],
+                'candidate_name': r['full_name'], 'short_name': r['short_name'],
+                'address': r['address'] or '', 'region': r['region'] or '', 'city': '',
+                'postal_code': (re.search(r'\b\d{6}\b', r['address'] or '') or [''])[0],
+                'legal_status': 'Действующее' if active else (r['status'] or 'статус неизвестен'),
+                'branch_type': '', 'source': 'Реестр лицензий', 'source_url': LICENSE_SOURCE_PAGE,
+                'certificate_id': r['license_number'], 'issue_date': r['date_start']})
+        return result, len(found) > 2000
+
+
 class RegistrySearch:
     def __init__(self, cache, config=None):
         self.config = config or _DEFAULT_CONFIG
@@ -418,7 +474,7 @@ class RegistrySearch:
         return result, len(found) > 2000
 
 
-def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, config=None):
+def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, config=None, licenses=None):
     cfg = config or _DEFAULT_CONFIG
     by_id = {r['record_id']: r for r in result['records']}
     resolutions, candidates = [], []
@@ -428,15 +484,32 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
         record = by_id[group['record_ids'][0]]
         found = []
         selected = None
-        for query in queries(record, cfg):
+        ranked = []
+        license_used, license_truncated = False, False
+        # 1. Реестр лицензий Рособрнадзора - основной источник по умолчанию.
+        #    Если совпадение найдено, DaData не вызывается.
+        if licenses is not None:
             if check_cancel:
                 check_cancel()
-            found.extend(api.search(query, group['group_id']))
-            if check_cancel:
-                check_cancel()
-            selected, ranked = choose(record, found, cfg)
-            if selected:
-                break
+            license_used = True
+            licensed, license_truncated = licenses.search(record)
+            chosen, license_ranked = choose(record, licensed, cfg)
+            if chosen and not license_truncated:
+                selected = chosen
+            ranked.extend(license_ranked)
+        # 2. DaData - вспомогательный источник: работает только если передан ключ.
+        if not selected:
+            da_ranked = []
+            for query in queries(record, cfg):
+                if check_cancel:
+                    check_cancel()
+                found.extend(api.search(query, group['group_id']))
+                if check_cancel:
+                    check_cancel()
+                selected, da_ranked = choose(record, found, cfg)
+                if selected:
+                    break
+            ranked.extend(da_ranked)
         registry_used, truncated = False, False
         if not selected and registry is not None:
             if check_cancel:
@@ -476,6 +549,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
 
         resolutions.append({'group_id': group['group_id'], 'record_ids': group['record_ids'],
             'source_name': record['name'], 'selected': selected, 'status': status,
+            'license_used': license_used, 'license_truncated': license_truncated,
             'registry_used': registry_used, 'registry_truncated': truncated,
             'candidate_count': len(unique)})
         if progress:
@@ -484,5 +558,6 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             on_progress(index, len(result['groups']))
     result['resolution'] = {'groups': resolutions, 'candidates': candidates, 'requests': api.requests,
                             'actual_requests': api.actual_requests,
+                            'license': licenses.metadata if licenses is not None else {},
                             'registry': registry.metadata if registry is not None else {}}
     return result
