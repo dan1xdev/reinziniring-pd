@@ -62,7 +62,7 @@ class PipelineTests(unittest.TestCase):
     def test_college_at_university_remains(self):
         record = self.result(row(name="Университет — колледж", education="СПО"))["records"][0]
         self.assertEqual(record["selection"], "ОТОБРАНО")
-        self.assertIn("ВОЗМОЖНОЕ_ПОДРАЗДЕЛЕНИЕ_ВУЗА", record["flags"])
+        self.assertIn("ПОДРАЗДЕЛЕНИЕ_ВУЗА", record["flags"])
 
     def test_document_fallback_not_training_level(self):
         record = self.result(row(education="", document="Аттестат о среднем общем образовании",
@@ -141,6 +141,15 @@ class PipelineTests(unittest.TestCase):
         result = self.result(row(1, name="ГБОУ г. Москвы Школа на Яузе"),
                              row(2, name="Школа на Яузе, г. Москва"))
         self.assertEqual(len(result["possible_matches"]), 1)
+
+    def test_citizenship_and_admission_level_do_not_exclude(self):
+        record = self.result(row(
+            citizenship="Казахстан",
+            training="Бакалавриат",
+            education="Среднее общее"
+        ))["records"][0]
+
+        self.assertEqual(record["selection"], "ОТОБРАНО")
 
 
 class InputExportTests(unittest.TestCase):
