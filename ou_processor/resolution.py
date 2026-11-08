@@ -341,8 +341,9 @@ def choose(record, candidates, config=None):
         top2 = sorted_distinct[1]
         exact_inn = record.get('inn_raw') and record['inn_raw'] == top1['candidate_inn']
         if not exact_inn and not exact_quoted and (top1['score'] - top2['score'] < margin_threshold):
+            # Неясность между лидерами запрещает выбирать и любого следующего кандидата.
             for c in ranked:
-                if c['candidate_inn'] in (top1['candidate_inn'], top2['candidate_inn']):
+                if c['eligible'] or c['candidate_inn'] in (top1['candidate_inn'], top2['candidate_inn']):
                     c['reasons'].append('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ')
                     c['eligible'] = False
             eligible_inns = {c['candidate_inn'] for c in ranked if c['eligible']}
@@ -366,7 +367,8 @@ def choose(record, candidates, config=None):
 
 
 class RegistrySearch:
-    def __init__(self, cache):
+    def __init__(self, cache, config=None):
+        self.config = config or _DEFAULT_CONFIG
         current = current_snapshot(Path(cache))
         if not current:
             raise ValueError('Нет скачанного резервного реестра')
@@ -377,7 +379,7 @@ class RegistrySearch:
         self.regions = [row[0] for row in self.connection.execute('SELECT DISTINCT region FROM organizations')]
 
     def search(self, record):
-        significant = meaningful(record)
+        significant = meaningful(record, self.config)
         nums = school_numbers(record['name'])
         tokens = [max(significant, key=lambda w: (len(w), w))] if significant else []
         if nums:
@@ -442,7 +444,9 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             registry_used = True
             reserve, truncated = registry.search(record)
             chosen, reserve_ranked = choose(record, reserve, cfg)
-            primary_inns = {c['candidate_inn'] for c in ranked if c['eligible']}
+            # Недостаточный отрыв сохраняет возможные ИНН основного поиска.
+            primary_inns = {c['candidate_inn'] for c in ranked if c['eligible'] or
+                            c['reasons'] == ['НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ']}
             if chosen and not truncated and (not primary_inns or chosen['candidate_inn'] in primary_inns):
                 selected = chosen
             ranked.extend(reserve_ranked)
@@ -457,7 +461,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             status = 'СОПОСТАВЛЕНО'
         elif any('ОБРЕЗАННОЕ_НАЗВАНИЕ' in c['reasons'] for c in ranked) or 'ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ' in record.get('flags', []):
             status = 'ПРОВЕРИТЬ_ОБРЕЗКА'
-        elif any('КОНФЛИКТ_РЕГИОНА' in c['reasons'] or 'РЕГИОН_НЕ_СОВПАЛ' in c['reasons'] for c in ranked) or 'КОНФЛИКТ_РЕГИОНА' in record.get('flags', []):
+        elif any('КОНФЛИКТ_РЕГИОНА' in c['reasons'] or 'REGION_НЕ_СОВПАЛ' in c['reasons'] for c in ranked) or 'КОНФЛИКТ_РЕГИОНА' in record.get('flags', []):
             status = 'ПРОВЕРИТЬ_КОНФЛИКТ_РЕГИОНА'
         elif any('НЕПОДТВЕРЖДЕННОЕ_ПРАВОПРЕЕМСТВО' in c['reasons'] or 'СТАРЫЙ_ВЫПУСК_ТРЕБУЕТ_ПРОВЕРКИ' in c['reasons'] for c in ranked) or 'СТАРЫЙ_ВЫПУСК' in record.get('flags', []):
             status = 'ПРОВЕРИТЬ_ПРАВОПРЕЕМСТВО'

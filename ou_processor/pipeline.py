@@ -96,7 +96,8 @@ def group_records(records):
         key = (record["normalized_name"], record["region"], record["city"])
         # Неполные/конфликтные данные не дают права склеивать строки.
         isolate = not record["region"] or not record["city"] or any(
-            flag in record["flags"] for flag in ["КОНФЛИКТ_РЕГИОНА", "КОНФЛИКТ_ГОРОДА", "ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ"])
+            flag in record["flags"] for flag in ["КОНФЛИКТ_РЕГИОНА", "КОНФЛИКТ_ГОРОДА",
+                                                "ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ", "СТАРЫЙ_ВЫПУСК"])
         if isolate:
             key += (record["record_id"],)
         buckets[key].append(record)
