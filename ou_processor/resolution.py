@@ -219,7 +219,7 @@ def assess(record, candidate, config=None):
         reasons.append('КОНФЛИКТ_РЕГИОНА')
     if 'КОНФЛИКТ_ГОРОДА' in record.get('flags', []):
         reasons.append('КОНФЛИКТ_ГОРОДА')
-    if 'ВОЗМОЖНОЕ_ПОДРАЗДЕЛЕНИЕ_ВУЗА' in record.get('flags', []):
+    if {'ВОЗМОЖНОЕ_ПОДРАЗДЕЛЕНИЕ_ВУЗА', 'ПОДРАЗДЕЛЕНИЕ_ВУЗА'} & set(record.get('flags', [])):
         reasons.append('ПОДРАЗДЕЛЕНИЕ_ВУЗА_ТРЕБУЕТ_ПРОВЕРКИ')
     if 'ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ' in record.get('flags', []):
         reasons.append('ОБРЕЗАННОЕ_НАЗВАНИЕ')
