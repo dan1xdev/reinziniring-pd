@@ -24,6 +24,7 @@ ALIASES = {
     "student_name": ["ФИО", "ФИО ученика", "ФИО поступающего"],
     "school_address_raw": ["Адрес", "Адрес ОУ", "Адрес школы", "Адрес образовательного учреждения", "Юридический адрес"],
     "postal_code_raw": ["Индекс", "Почтовый индекс"],
+    "specialty_code": ["Код специальности", "Код направления"],
 }
 
 REQUIRED_GROUPS = [("name",), ("education", "document")]
@@ -36,6 +37,8 @@ REQUIRED_LABELS = {
 }
 
 SERVICE_SHEETS = ["ВУЗы", "Не нашли"]
+
+DAMAGE_CHECK_FIELDS = ("specialty_code", "year")
 
 
 def personal_file_number(cell):
@@ -72,15 +75,11 @@ def _check_damaged_cell(cell, value):
     
     if isinstance(value, (datetime.datetime, datetime.date)):
         flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
-        
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-        if abs(value) > 10000:
-            flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
-            
     elif isinstance(value, str) and ("E+" in value or "e+" in value):
         flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
-        
-    elif cell.number_format and any(char in cell.number_format.upper() for char in ("Y", "M", "D", "H")):
+    elif isinstance(value, (int, float)) and not isinstance(value, bool) and (
+            abs(value) > 10000
+            or (cell.number_format and any(char in cell.number_format.upper() for char in ("Y", "M", "D", "H")))):
         flags.append("ПОВРЕЖДЁН_КОД_EXCEL")
         
     return flags
@@ -192,7 +191,7 @@ def read_records(paths, should_cancel=None, sheet_name=None):
         sources.append({"file": path.name, "source_id": source_id, "sha256": digest,
                         "rows": count, "skipped_sheets": skipped})
 
-        records = dedupe_personal_files(records, sources)
+    records = dedupe_personal_files(records, sources)
 
     return records, sources
 
@@ -258,8 +257,11 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
 
         # Проверяем ячейки на повреждение Excel
         input_flags = []
-        for index in mapping.values():
-            input_flags.extend(_check_damaged_cell(cells[index], cells[index].value))
+        for field in DAMAGE_CHECK_FIELDS:
+            if field in mapping:
+                index = mapping[field]
+                input_flags.extend(_check_damaged_cell(cells[index], cells[index].value))
+
             
         record.update({"record_id": f"{source_id}:{sheet.title}:{row_number}",
                        "source_file": filename, "source_sheet": sheet.title,

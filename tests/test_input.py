@@ -232,7 +232,7 @@ class FormatSupportTests(unittest.TestCase):
             sheet.title = "Лист рабочий"
             # Заголовки из реальной выгрузки отдела
             header = [
-                "Форма обучения", "Код специальности", "Направление\специальность", "Профиль",
+                "Форма обучения", "Код специальности", "Направление\\специальность", "Профиль",
                 "Профиль.Сокращенное наименование", "Конкурсная группа", "Личное дело.Номер",
                 "Уровень подготовки", "ФИО", "Тип документа об образовании",
                 "Образовательное учреждение", "Полное название ОУ в именительном падеже",
@@ -254,6 +254,98 @@ class FormatSupportTests(unittest.TestCase):
             self.assertEqual(records[0]["personal_file_number"], "T-1001")
             self.assertEqual(records[0]["name"], "ГБОУ Школа № 1284")
             self.assertEqual(records[0]["document"], "Аттестат о среднем общем образовании")
+
+class ExclusionLogicTests(unittest.TestCase):
+    def process_row(self, name, inn="", address="", education="Среднее общее", **extra):
+        import json
+        from pathlib import Path
+        from ou_processor.pipeline import process
+        config = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text(encoding="utf-8"))
+        
+        record = {
+            "record_id": "1", 
+            "name": name, 
+            "inn_raw": inn, 
+            "school_address_raw": address, 
+            "education": education, 
+            "formula_fields": []
+        }
+        record.update(extra)
+        return process([record], config)["records"][0]
+
+    def test_foreign_school_is_excluded(self):
+        record = self.process_row(name="СОШ № 5, г. Алматы")
+        self.assertEqual(record["country"], "ЗА_РУБЕЖОМ")
+        self.assertEqual(record["selection"], "ИСКЛЮЧЕНО")
+        self.assertIn("ЗАРУБЕЖНОЕ_ОУ", record["flags"])
+
+    def test_foreign_school_with_russian_inn_goes_to_review(self):
+        record = self.process_row(
+            name="Школа № 1, г. Минск", 
+            inn="7707083893" # Валидный ИНН Сбербанка
+        )
+        self.assertEqual(record["country"], "КОНФЛИКТ_СТРАНЫ")
+        self.assertEqual(record["selection"], "ПРОВЕРИТЬ_ОТБОР")
+        self.assertIn("КОНФЛИКТ_СТРАНЫ", record["flags"])
+
+    def test_higher_education_is_excluded(self):
+        record = self.process_row(name="МГУ имени Ломоносова", education="Высшее")
+        self.assertEqual(record["selection"], "ИСКЛЮЧЕНО")
+        self.assertNotIn("ЗАРУБЕЖНОЕ_ОУ", record["flags"])
+
+    def test_unknown_country_is_not_excluded(self):
+        record = self.process_row(name="ООО Ромашка")
+        self.assertEqual(record["country"], "НЕИЗВЕСТНО")
+        self.assertNotEqual(record["selection"], "ИСКЛЮЧЕНО")
+
+
+
+    def test_personal_file_conflict_goes_to_review(self):
+        record = self.process_row(name="ГБОУ Школа № 1", input_conflict=True)
+        self.assertEqual(record["selection"], "ПРОВЕРИТЬ_ОТБОР")
+        self.assertIn("КОНФЛИКТ_ЛИЧНОГО_ДЕЛА", record["flags"])
+
+    def test_country_counters_add_up(self):
+        import json
+        from ou_processor.pipeline import process
+        config = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text(encoding="utf-8"))
+        names = ["ГБОУ Школа № 1", "ООО Ромашка", "СОШ № 5, г. Алматы"]
+        records = [{"record_id": str(i), "name": n, "inn_raw": "", "school_address_raw": "",
+                    "education": "Среднее общее", "formula_fields": []} for i, n in enumerate(names)]
+        s = process(records, config)["summary"]
+        self.assertEqual(s["russian_probable_rows"], 1)
+        self.assertEqual(s["unknown_country_rows"], 1)
+        self.assertEqual(s["foreign_rows"], 1)
+        total = (s["russian_rows"] + s["russian_probable_rows"] + s["unknown_country_rows"]
+                 + s["foreign_rows"] + s["conflict_rows"])
+        self.assertEqual(total, s["input_rows"])
+
+
+class DamagedScopeTests(unittest.TestCase):
+    def read_row(self, header, row):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "Данные"
+            sheet.append(header)
+            sheet.append(row)
+            book.save(path)
+            records, _ = read_records([path])
+        return records[0]
+
+    def test_specialty_code_date_flagged_once(self):
+        import datetime
+        record = self.read_row(
+            ["ФИО", "Образовательное учреждение", "Вид образования", "Код специальности"],
+            ["Иванов", "Школа 1", "Среднее общее", datetime.datetime(2001, 3, 9)])
+        self.assertEqual(record["input_flags"].count("ПОВРЕЖДЁН_КОД_EXCEL"), 1)
+
+    def test_numeric_inn_index_and_file_number_not_flagged(self):
+        record = self.read_row(
+            ["ФИО", "Образовательное учреждение", "Вид образования", "ИНН", "Индекс", "Личное дело.Номер"],
+            ["Иванов", "Школа 1", "Среднее общее", 7707083893, 119019, 123456])
+        self.assertEqual(record["input_flags"], [])
 
 
 if __name__ == "__main__":

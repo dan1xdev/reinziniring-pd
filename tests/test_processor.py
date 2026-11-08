@@ -62,7 +62,7 @@ class PipelineTests(unittest.TestCase):
     def test_college_at_university_remains(self):
         record = self.result(row(name="Университет — колледж", education="СПО"))["records"][0]
         self.assertEqual(record["selection"], "ОТОБРАНО")
-        self.assertIn("ВОЗМОЖНОЕ_ПОДРАЗДЕЛЕНИЕ_ВУЗА", record["flags"])
+        self.assertIn("ПОДРАЗДЕЛЕНИЕ_ВУЗА", record["flags"])
 
     def test_document_fallback_not_training_level(self):
         record = self.result(row(education="", document="Аттестат о среднем общем образовании",
