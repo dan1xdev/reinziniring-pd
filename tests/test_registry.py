@@ -11,6 +11,7 @@ import zipfile
 
 from ou_processor.registry import build_index, cache_lock, current_snapshot, lookup, update
 from ou_processor.registry_worker import RegistryWorker
+from ou_processor.resolution import RegistrySearch
 from ou_processor.web import Application
 
 
@@ -56,6 +57,22 @@ class Server:
 
 
 class RegistryTests(unittest.TestCase):
+    # Служебное слово из пользовательского словаря не сужает поиск до пустой выдачи.
+    def test_search_uses_configured_stop_words(self):
+        config = json.loads((Path(__file__).resolve().parents[1] / 'config.json').read_text(encoding='utf-8'))
+        config['stop_words'].append('экспериментальная')
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            update(cache, opener=Server())
+            registry = RegistrySearch(cache, config=config)
+            try:
+                candidates, truncated = registry.search(dict(
+                    name='Экспериментальная Тестовая школа № 1', city='Москва', region='Москва'))
+                self.assertEqual({c['candidate_inn'] for c in candidates}, {'0000000001'})
+                self.assertFalse(truncated)
+            finally:
+                registry.connection.close()
+
     def test_background_auto_update_and_existing_snapshot_during_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)

@@ -216,10 +216,10 @@ class Application:
             self.change(job_id, phase='Ищем организации и адреса', progress=8, total=len(result['groups']))
             api = SearchCache(self.cache, None if offline else self.client_factory(token))
             try:
-                reserve = RegistrySearch(self.registry)
+                reserve = RegistrySearch(self.registry, config=config)
             except (ValueError, OSError, KeyError, sqlite3.Error):
                 reserve = None
-            resolve(result, api, reserve, progress=False,
+            resolve(result, api, reserve, progress=False, config=config,
                 on_progress=lambda done, total: self.progress(job_id, done, total),
                 check_cancel=lambda: self.check_cancel(job_id))
             self.check_cancel(job_id)

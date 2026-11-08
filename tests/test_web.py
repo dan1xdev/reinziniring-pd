@@ -33,6 +33,31 @@ def school_upload():
 
 
 class UploadTests(unittest.TestCase):
+    # Порог из файла настроек текущего запуска влияет на подбор и итоговый Excel.
+    def test_processing_uses_current_config_threshold(self):
+        config = json.loads((Path(__file__).resolve().parents[1] / 'config.json').read_text(encoding='utf-8'))
+        cached = dict(candidate_inn='123', candidate_name='ГБОУ школа № 1', candidate_ogrn='456',
+            postal_code='123456', region='Москва', city='Москва', address='Москва, ул А, д 1',
+            legal_status='ACTIVE', branch_type='MAIN', source='DaData')
+        for threshold, school_count in [(85, 1), (101, 0)]:
+            with self.subTest(threshold=threshold), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                config['scoring']['thresholds']['auto_match_min_score'] = threshold
+                (root / 'config.json').write_text(json.dumps(config), encoding='utf-8')
+                (root / 'cache.json').write_text(json.dumps({
+                    'ГБОУ г. Москвы «Школа № 1» Москва': {'status': 'OK', 'candidates': [cached]}
+                }), encoding='utf-8')
+                app = Application(root / 'runs', root / 'registry', root / 'cache.json')
+                app.jobs['configured'] = {'status': 'running'}
+                with patch('ou_processor.web.ROOT', root):
+                    app.run('configured', unpack_uploads([school_upload()]), '', True)
+                job = app.snapshot('configured')
+                self.assertEqual(job['status'], 'done', job.get('error'))
+                self.assertEqual(job['summary']['schools'], school_count)
+                book = load_workbook(root / 'runs' / 'configured' / 'result' / 'schools.xlsx', read_only=True)
+                self.assertEqual(book['Учреждения'].max_row, school_count + 1)
+                book.close()
+
     def test_without_registry_processing_finishes_and_exports_review(self):
         class EmptyClient:
             def __init__(self, token):
