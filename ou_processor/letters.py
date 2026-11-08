@@ -67,58 +67,79 @@ def valid_inn(value):
 
 def valid_postal_code(value):
     code = _value(value)
-    return (
-        len(code) == 6
-        and code.isascii()
-        and code.isdecimal()
-    )
+    return bool(re.fullmatch(r"[0-9]{6}", code))
 
 
 def postal_details(candidate):
     address = _value(candidate.get("address"))
     explicit = _value(candidate.get("postal_code"))
-
-    found = set(
-        re.findall(r"(?<!\d)[0-9]{6}(?!\d)", address)
-    )
-
     notes = []
+
+    indices = re.findall(
+        r"(?<!\d)[0-9]{6}(?!\d)", address
+    )
+    unique_indices = set(indices)
 
     if explicit and not valid_postal_code(explicit):
         notes.append("Некорректный индекс в источнике")
 
-    if len(found) > 1:
-        notes.append("В адресе найдено несколько индексов")
+    if len(unique_indices) > 1:
+        notes.append("В адресе обнаружены разные индексы")
 
-    if explicit and found and explicit not in found:
-        notes.append("Индексы в источнике не совпадают")
+    if (
+        valid_postal_code(explicit)
+        and unique_indices
+        and unique_indices != {explicit}
+    ):
+        notes.append("Индексы в источниках не совпадают")
 
     code = ""
 
     if valid_postal_code(explicit):
         code = explicit
-    elif len(found) == 1:
-        code = next(iter(found))
+    elif len(unique_indices) == 1:
+        code = next(iter(unique_indices))
 
     if notes:
         code = ""
 
     cleaned = re.sub(
-        r"^\s*[0-9]{6}\s*,?\s*", "", address
+        r"^\s*(?:Россия|Российская Федерация)\s*,?\s*",
+        "",
+        address,
+        flags=re.I,
     )
+
     cleaned = re.sub(
-        r"^Россия\s*,\s*", "", cleaned, flags=re.I
+        r"^\s*[0-9]{6}\s*,?\s*",
+        "",
+        cleaned,
     )
+
+    cleaned = re.sub(
+        r"^\s*(?:Россия|Российская Федерация)\s*,?\s*",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+    cleaned = cleaned.strip(" ,")
+
+    if re.match(r"^[0-9]{6}(?:\s|,|$)", cleaned):
+        cleaned = re.sub(
+            r"^[0-9]{6}\s*,?\s*",
+            "",
+            cleaned,
+        )
 
     if not cleaned:
         notes.append("Отсутствует адрес организации")
 
     if not valid_postal_code(code):
-        notes.append(
-            "Нет подтверждённого шестизначного индекса"
-        )
+        notes.append("Нет подтверждённого шестизначного индекса")
 
-    return code, cleaned, notes
+    return code, cleaned, sorted(set(notes))
 
 
 _ABBREVIATIONS = {
@@ -143,12 +164,19 @@ _GEOGRAPHY = {
 
 def _repair_uppercase(name):
     words = re.findall(
-        r"[А-ЯЁA-Z][А-ЯЁA-Z-]*", name
+        r"[А-Яа-яЁёA-Za-z]+(?:-[А-Яа-яЁёA-Za-z]+)*",
+        name,
     )
 
+    ordinary = [
+        word for word in words
+        if word.upper() not in _ABBREVIATIONS
+    ]
+
     all_caps = (
-        len(words) >= 3
-        and all(word == word.upper() for word in words)
+        len(words) >= 2
+        and bool(ordinary)
+        and all(word.isupper() for word in words)
     )
 
     if not all_caps:
@@ -183,9 +211,7 @@ def _repair_uppercase(name):
 
 
 def official_typography(value):
-    name = unicodedata.normalize(
-        "NFC", _value(value)
-    )
+    name = unicodedata.normalize("NFC", _value(value))
 
     name = (
         name.replace("„", "«")
@@ -219,6 +245,9 @@ def official_typography(value):
 
 
 _ADJECTIVE_ENDINGS = [
+    ("ский", "ского"),
+    ("цкий", "цкого"),
+    ("кий", "кого"),
     ("ое", "ого"),
     ("ее", "его"),
     ("ая", "ой"),
@@ -258,25 +287,30 @@ def genitive_official_name(name):
         None,
     )
 
-    if head_idx is None or head_idx == 0 or head_idx > 9:
+    if head_idx is None or head_idx > 9:
         return "", False
 
     converted = []
 
     for word in words[:head_idx]:
-        lower = word.casefold()
+        if word in _ABBREVIATIONS:
+            converted.append(word)
+            continue
+
+        if word.isupper():
+            return "", False
 
         ending = next(
             (
                 (old, new)
                 for old, new in _ADJECTIVE_ENDINGS
-                if lower.endswith(old)
+                if word.casefold().endswith(old)
                 and len(word) > len(old) + 2
             ),
             None,
         )
 
-        if not ending:
+        if ending is None:
             return "", False
 
         old, new = ending
@@ -288,21 +322,20 @@ def genitive_official_name(name):
         converted.append(changed)
 
     head = words[head_idx]
+
+    if head.isupper():
+        return "", False
+
     new_head = _NOUNS[head.casefold()]
 
     if head[0].isupper():
-        new_head = new_head.capitalize()
+        new_head = new_head[0].upper() + new_head[1:]
 
     converted.append(new_head)
 
     tail = " ".join(words[head_idx + 1:])
 
-    if re.search(
-        r"\b(?:организация|школа|гимназия|лицей|"
-        r"университет|институт|колледж|техникум)\b",
-        tail,
-        re.I,
-    ):
+    if tail and not re.fullmatch(r"№\s*\d+", tail):
         return "", False
 
     result = " ".join(
@@ -373,9 +406,7 @@ def _students(students):
             counters[name] += 1
 
     if any(count > 1 for count in counters.values()):
-        notes.append(
-            "Повтор ФИО без номера личного дела"
-        )
+        notes.append("Повтор ФИО без номера личного дела")
 
     ordered = sorted(
         names,
@@ -396,8 +427,7 @@ def _preferred_candidates(groups):
     ]
 
     primary = [
-        candidate
-        for candidate in candidates
+        candidate for candidate in candidates
         if candidate.get("source") == "DaData"
     ]
 
@@ -406,14 +436,11 @@ def _preferred_candidates(groups):
 
 def _prepare_one(inn, groups, students, override=None):
     checks = []
-
     candidates = _preferred_candidates(groups)
     chosen = candidates[0] if candidates else {}
 
     if not valid_inn(inn):
-        checks.append(
-            "ИНН не прошёл проверку контрольной суммы"
-        )
+        checks.append("ИНН не прошёл проверку контрольной суммы")
 
     if not candidates:
         checks.append(
@@ -427,27 +454,38 @@ def _prepare_one(inn, groups, students, override=None):
     }
 
     if len(official_names) != 1:
-        checks.append(
-            "Официальные названия не совпадают"
-        )
+        checks.append("Официальные названия не совпадают")
 
     official_name, restored = official_typography(
         chosen.get("candidate_name", "")
     )
 
     if not official_name:
-        checks.append(
-            "Отсутствует официальное название"
-        )
+        checks.append("Отсутствует официальное название")
 
     if official_name.count("«") != official_name.count("»"):
-        checks.append(
-            "Несбалансированные кавычки в названии"
-        )
+        checks.append("Несбалансированные кавычки в названии")
 
     if restored:
         checks.append(
             "Регистр восстановлен автоматически — проверить"
+        )
+
+    suspicious_words = [
+        word
+        for word in re.findall(
+            r"[А-Яа-яЁёA-Za-z]+", official_name
+        )
+        if (
+            len(word) > 3
+            and word.isupper()
+            and word not in _ABBREVIATIONS
+        )
+    ]
+
+    if suspicious_words:
+        checks.append(
+            "Регистр отдельных слов требует проверки"
         )
 
     genitive, template_ok = genitive_official_name(
@@ -455,29 +493,42 @@ def _prepare_one(inn, groups, students, override=None):
     )
 
     if not template_ok:
-        checks.append(
-            "Родительный падеж требует проверки"
-        )
+        checks.append("Родительный падеж требует проверки")
 
     if override and override.get("verified") is True:
-        if override.get("official_name"):
-            official_name, restored = official_typography(
-                override["official_name"]
-            )
+        manual_name = _value(override.get("official_name"))
+        manual_genitive = _value(
+            override.get("genitive_name")
+        )
 
-        if override.get("genitive_name"):
-            genitive = _value(
-                override["genitive_name"]
-            )
+        corrected, _ = official_typography(manual_name)
 
-        if not restored and genitive and official_name:
+        if (
+            corrected
+            and manual_genitive
+            and corrected.count("«") == corrected.count("»")
+            and manual_genitive.count("«")
+                == manual_genitive.count("»")
+        ):
+            official_name = corrected
+            genitive = manual_genitive
+
             checks = [
                 check for check in checks
                 if not check.startswith((
                     "Регистр восстановлен",
+                    "Регистр отдельных слов",
                     "Родительный падеж",
                 ))
+                and check not in {
+                    "Отсутствует официальное название",
+                    "Несбалансированные кавычки в названии",
+                }
             ]
+        else:
+            checks.append(
+                "Подтверждённые исправления заполнены неверно"
+            )
 
     addresses = {
         _normalized(candidate.get("address"))
@@ -492,14 +543,10 @@ def _prepare_one(inn, groups, students, override=None):
     }
 
     if len(addresses) > 1:
-        checks.append(
-            "Адреса в источниках не совпадают"
-        )
+        checks.append("Адреса в источниках не совпадают")
 
     if len(postcodes) > 1:
-        checks.append(
-            "Индексы в источниках не совпадают"
-        )
+        checks.append("Индексы в источниках не совпадают")
 
     code, address, postal_notes = postal_details(chosen)
     checks.extend(postal_notes)
@@ -535,8 +582,7 @@ def _prepare_one(inn, groups, students, override=None):
     return {
         "status": (
             "Готово к печати"
-            if not checks
-            else "Проверить"
+            if not checks else "Проверить"
         ),
         "letter_type": kind,
         "inn": inn,
@@ -548,8 +594,7 @@ def _prepare_one(inn, groups, students, override=None):
         "address": address,
         "mailing_address": (
             f"{code}, {address}"
-            if code and address
-            else ""
+            if code and address else ""
         ),
         "source": chosen.get("source", ""),
         "source_url": chosen.get("source_url", ""),
@@ -574,9 +619,7 @@ def prepare_letters(result, overrides=None):
         if selected and _value(
             selected.get("candidate_inn")
         ):
-            inn = _value(
-                selected["candidate_inn"]
-            )
+            inn = _value(selected["candidate_inn"])
             groups_by_inn[inn].append(group)
         else:
             unresolved.append(group)
@@ -609,9 +652,7 @@ def prepare_letters(result, overrides=None):
         }
 
         if any(
-            not _value(
-                by_id[record_id].get("student_name")
-            )
+            not _value(by_id[record_id].get("student_name"))
             for record_id in member_ids
             if record_id in by_id
         ):
@@ -631,22 +672,16 @@ def prepare_letters(result, overrides=None):
 
         students = [
             {
-                "student": member.get(
-                    "student_name", ""
-                ),
+                "student": member.get("student_name", ""),
                 "file": member.get(
                     "personal_file_number", ""
                 ),
-                "record_ids": member.get(
-                    "record_id", ""
-                ),
+                "record_ids": member.get("record_id", ""),
             }
             for member in members
         ]
 
-        row = _prepare_one(
-            "", [group], students
-        )
+        row = _prepare_one("", [group], students)
 
         row["official_name"] = _value(
             group.get("source_name")
