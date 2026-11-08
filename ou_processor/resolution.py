@@ -427,8 +427,8 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             check_cancel()
         record = by_id[group['record_ids'][0]]
         found = []
-        selected = None
-        for query in queries(record, cfg):
+        selected, ranked = None, []
+        for query in queries(record, cfg) if api is not None else []:
             if check_cancel:
                 check_cancel()
             found.extend(api.search(query, group['group_id']))
@@ -479,10 +479,10 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             'registry_used': registry_used, 'registry_truncated': truncated,
             'candidate_count': len(unique)})
         if progress:
-            print(f"{index}/{len(result['groups'])}: {status}; DaData={api.actual_requests}", flush=True)
+            print(f"{index}/{len(result['groups'])}: {status}; DaData={api.actual_requests if api else 0}", flush=True)
         if on_progress:
             on_progress(index, len(result['groups']))
-    result['resolution'] = {'groups': resolutions, 'candidates': candidates, 'requests': api.requests,
-                            'actual_requests': api.actual_requests,
+    result['resolution'] = {'groups': resolutions, 'candidates': candidates, 'requests': api.requests if api else [],
+                            'actual_requests': api.actual_requests if api else 0,
                             'registry': registry.metadata if registry is not None else {}}
     return result
