@@ -142,6 +142,15 @@ class PipelineTests(unittest.TestCase):
                              row(2, name="Школа на Яузе, г. Москва"))
         self.assertEqual(len(result["possible_matches"]), 1)
 
+    def test_citizenship_and_admission_level_do_not_exclude(self):
+        record = self.result(row(
+            citizenship="Казахстан",
+            training="Бакалавриат",
+            education="Среднее общее"
+        ))["records"][0]
+
+        self.assertEqual(record["selection"], "ОТОБРАНО")
+
 
 class InputExportTests(unittest.TestCase):
     def test_read_report_header_ignore_analyst_region_keep_student_locally(self):

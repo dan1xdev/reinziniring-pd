@@ -209,5 +209,52 @@ class DamagedCodeTests(unittest.TestCase):
         self.assertIn("ПОВРЕЖДЁН_КОД_EXCEL", records[0]["input_flags"])
 
 
+class FormatSupportTests(unittest.TestCase):
+    def test_region_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "Данные"
+            # Тестируем длинное название из ТЗ
+            sheet.append(["ФИО", "Образовательное учреждение", "Вид образования", "Регион образовательного учреждения"])
+            sheet.append(["Иванов", "Школа 1", "Среднее общее", "Московская область"])
+            book.save(path)
+
+            records, _ = read_records([path])
+            self.assertEqual(records[0]["region_raw"], "Московская область")
+
+    def test_reads_department_export_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "Лист рабочий"
+            # Заголовки из реальной выгрузки отдела
+            header = [
+                "Форма обучения", "Код специальности", "Направление\специальность", "Профиль",
+                "Профиль.Сокращенное наименование", "Конкурсная группа", "Личное дело.Номер",
+                "Уровень подготовки", "ФИО", "Тип документа об образовании",
+                "Образовательное учреждение", "Полное название ОУ в именительном падеже",
+                "Название ОУ в родительном падеже", "Адрес", "Индекс"
+            ]
+            sheet.append(header)
+            sheet.append([
+                "Очная", "09.03.01", "Информатика", "ИБС", "4.0",
+                "09.03.01.04 (Б-О, Москва)", "T-1001", "Бакалавриат",
+                "Иванов Иван", "Аттестат о среднем общем образовании",
+                "ГБОУ Школа № 1284", "", "", "", ""
+            ])
+            book.save(path)
+
+            records, _ = read_records([path])
+
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["student_name"], "Иванов Иван")
+            self.assertEqual(records[0]["personal_file_number"], "T-1001")
+            self.assertEqual(records[0]["name"], "ГБОУ Школа № 1284")
+            self.assertEqual(records[0]["document"], "Аттестат о среднем общем образовании")
+
+
 if __name__ == "__main__":
     unittest.main()
