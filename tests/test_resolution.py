@@ -7,14 +7,14 @@ from ou_processor.full_run import aggregate
 from ou_processor.web import JobCancelled
 
 
-def record(name='ГБОУ школа № 1', city='Москва', region='Москва', **extra):
-    return dict(name=name, city=city, region=region, flags=[], **extra)
+def record(name='ГБОУ школа № 1', city='Москва', region='Москва', flags=None, **extra):
+    return dict(name=name, city=city, region=region, flags=[] if flags is None else flags, **extra)
 
 
-def candidate(inn='123', name='ГБОУ школа № 1', **extra):
-    return dict(candidate_inn=inn,candidate_name=name, candidate_ogrn='456',
-        postal_code='123456',region='г Москва',city='г Москва',address='г Москва, ул А, д 1',
-        legal_status='ACTIVE',branch_type='MAIN',source='DaData',**extra)
+def candidate(inn='123', name='ГБОУ школа № 1', legal_status='ACTIVE', region='г Москва', city='г Москва', address='г Москва, ул А, д 1', **extra):
+    return dict(candidate_inn=inn, candidate_name=name, candidate_ogrn='456',
+        postal_code='123456', region=region, city=city, address=address,
+        legal_status=legal_status, branch_type='MAIN', source='DaData', **extra)
 
 
 class ResolutionTests(unittest.TestCase):
@@ -176,3 +176,209 @@ class ResolutionTests(unittest.TestCase):
         selected,_=choose(r,[other,exact])
         self.assertEqual(selected['candidate_inn'],'123')
         self.assertEqual(selected['candidate_name'],exact['candidate_name'])
+
+    def test_candidate_margin_triggers_review_when_small_difference(self):
+        # Два кандидата с разными ИНН, один 95 баллов, второй 90 баллов (разница 5 < 15)
+        r = record(name='Школа № 5 г. Москвы', city='Москва', region='Москва')
+        c1 = candidate(inn='111', name='ГБОУ Школа № 5 города Москвы')
+        c2 = candidate(inn='222', name='ГБОУ Школа № 5 имени Ломоносова города Москвы')
+        selected, ranked = choose(r, [c1, c2])
+        self.assertIsNone(selected)
+        c1_ranked = next(c for c in ranked if c['candidate_inn'] == '111')
+        self.assertIn('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ', c1_ranked['reasons'])
+
+    def test_truncated_name_vetoes_auto_match(self):
+        r = record(name='ГБОУ города Москвы «Школа № 1284', flags=['ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ'])
+        c = candidate(inn='123', name='ГБОУ города Москвы «Школа № 1284»')
+        selected, ranked = choose(r, [c])
+        self.assertIsNone(selected)
+        self.assertIn('ОБРЕЗАННОЕ_НАЗВАНИЕ', ranked[0]['reasons'])
+
+    def test_old_graduation_year_vetoes_auto_match(self):
+        r = record(name='ГБОУ города Москвы «Школа № 1284»', flags=['СТАРЫЙ_ВЫПУСК'])
+        c = candidate(inn='123', name='ГБОУ города Москвы «Школа № 1284»')
+        selected, ranked = choose(r, [c])
+        self.assertIsNone(selected)
+        self.assertIn('НЕПОДТВЕРЖДЕННОЕ_ПРАВОПРЕЕМСТВО', ranked[0]['reasons'])
+        self.assertIn('СТАРЫЙ_ВЫПУСК_ТРЕБУЕТ_ПРОВЕРКИ', ranked[0]['reasons'])
+
+    def test_region_conflict_vetoes_auto_match(self):
+        r = record(name='ГБОУ города Москвы «Школа № 1284»', city='Москва', region='Москва', flags=['КОНФЛИКТ_РЕГИОНА'])
+        c = candidate(inn='123', name='ГБОУ города Москвы «Школа № 1284»', region='г Москва', city='г Москва')
+        selected, ranked = choose(r, [c])
+        self.assertIsNone(selected)
+        self.assertIn('КОНФЛИКТ_РЕГИОНА', ranked[0]['reasons'])
+
+    def test_liquidated_entity_vetoes_auto_match(self):
+        r = record(name='ГБОУ города Москвы «Школа № 1284»', city='Москва', region='Москва')
+        c = candidate(inn='123', name='ГБОУ города Москвы «Школа № 1284»', legal_status='LIQUIDATED')
+        selected, ranked = choose(r, [c])
+        self.assertIsNone(selected)
+        self.assertIn('НЕПОДТВЕРЖДЕННОЕ_ПРАВОПРЕЕМСТВО', ranked[0]['reasons'])
+
+    def test_resolve_status_assignment(self):
+        class API:
+            actual_requests = 1
+            requests = []
+            def search(self, *args):
+                return [candidate(inn='123', name='ГБОУ города Москвы «Школа № 1284»')]
+
+        # Проверка статуса при обрезке
+        r1 = record(record_id='1', name='ГБОУ города Москвы «Школа № 1284', flags=['ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ'])
+        res1 = {'records': [r1], 'groups': [dict(group_id='g1', record_ids=['1'])]}
+        resolve(res1, API(), None, progress=False)
+        self.assertEqual(res1['resolution']['groups'][0]['status'], 'ПРОВЕРИТЬ_ОБРЕЗКА')
+
+        # Проверка статуса при конфликте региона
+        r2 = record(record_id='2', name='ГБОУ города Москвы «Школа № 1284»', flags=['КОНФЛИКТ_РЕГИОНА'])
+        res2 = {'records': [r2], 'groups': [dict(group_id='g2', record_ids=['2'])]}
+        resolve(res2, API(), None, progress=False)
+        self.assertEqual(res2['resolution']['groups'][0]['status'], 'ПРОВЕРИТЬ_КОНФЛИКТ_РЕГИОНА')
+
+        # Проверка статуса при старом выпуске
+        r3 = record(record_id='3', name='ГБОУ города Москвы «Школа № 1284»', flags=['СТАРЫЙ_ВЫПУСК'])
+        res3 = {'records': [r3], 'groups': [dict(group_id='g3', record_ids=['3'])]}
+        resolve(res3, API(), None, progress=False)
+        self.assertEqual(res3['resolution']['groups'][0]['status'], 'ПРОВЕРИТЬ_ПРАВОПРЕЕМСТВО')
+
+    def test_user_examples_match_across_all_variations(self):
+        # 10 организаций из реального примера пользователя во всех 4 вариантах написания
+        from ou_processor.geography import extract_geography
+        from ou_processor.normalization import normalize, numbers, institution_type
+        import json
+
+        config = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text(encoding="utf-8"))
+
+        test_cases = [
+            (
+                "Школа 1284",
+                ("1284",),
+                "ШКОЛА",
+                "Москва",
+                [
+                    "Государственное бюджетное общеобразовательное учреждение города Москвы «Школа № 1284»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «ШКОЛА № 1284»",
+                    "ГБОУ г. Москвы «Школа № 1284»",
+                    'ГБОУ города Москвы ""Школа №1284""',
+                ]
+            ),
+            (
+                "Школа на Яузе",
+                (),
+                "ШКОЛА",
+                "Москва",
+                [
+                    "Государственное бюджетное общеобразовательное учреждение города Москвы «Школа на Яузе»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «ШКОЛА НА ЯУЗЕ»",
+                    "ГБОУ г. Москвы «Школа на Яузе»",
+                    "школа на яузе, г. москва",
+                ]
+            ),
+            (
+                "Колледж 20",
+                ("20",),
+                "СПО",
+                "Москва",
+                [
+                    "Государственное бюджетное профессиональное образовательное учреждение города Москвы «Колледж автоматизации и информационных технологий № 20»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ПРОФЕССИОНАЛЬНОЕ ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «КОЛЛЕДЖ АВТОМАТИЗАЦИИ И ИНФОРМАЦИОННЫХ ТЕХНОЛОГИЙ № 20»",
+                    "ГБПОУ г. Москвы «Колледж автоматизации и информационных технологий № 20»",
+                    'ГБПОУ Г. МОСКВЫ ""КОЛЛЕДЖ АВТОМАТИЗАЦИИ И ИНФОРМАЦИОННЫХ ТЕХНОЛОГИЙ №20""',
+                ]
+            ),
+            (
+                "Школа 1508",
+                ("1508",),
+                "ШКОЛА",
+                "Москва",
+                [
+                    "Государственное бюджетное общеобразовательное учреждение города Москвы «Измайловская школа № 1508»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «ИЗМАЙЛОВСКАЯ ШКОЛА № 1508»",
+                    "ГБОУ г. Москвы «Измайловская школа № 1508»",
+                    "  ГБОУ г. Москвы   «Измайловская школа № 1508»  ",
+                ]
+            ),
+            (
+                "Школа 1290",
+                ("1290",),
+                "ШКОЛА",
+                "Москва",
+                [
+                    "Государственное бюджетное общеобразовательное учреждение города Москвы «Школа № 1290»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «ШКОЛА № 1290»",
+                    "ГБОУ г. Москвы «Школа № 1290»",
+                    "Государственное бюджетное общеобразовательное учреждение города Москвы Школа №1290",
+                ]
+            ),
+            (
+                "Школа 444",
+                ("444",),
+                "ШКОЛА",
+                "Москва",
+                [
+                    "Государственное бюджетное общеобразовательное учреждение города Москвы «Школа № 444»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «ШКОЛА № 444»",
+                    "ГБОУ г. Москвы «Школа № 444»",
+                    "ГБОУ Москва школа с углубленным изучением математики, информатики, физики № 444",
+                ]
+            ),
+            (
+                "Покровский квартал",
+                (),
+                "ШКОЛА",
+                "Москва",
+                [
+                    "Государственное бюджетное общеобразовательное учреждение города Москвы «Школа «Покровский квартал»»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «ШКОЛА «ПОКРОВСКИЙ КВАРТАЛ»»",
+                    "ГБОУ г. Москвы «Школа «Покровский квартал»»",
+                    'ГБОУ города Москвы ""Школа ""Покровский квартал"""',
+                ]
+            ),
+            (
+                "Колледж Николаева",
+                (),
+                "СПО",
+                "Москва",
+                [
+                    "Государственное бюджетное профессиональное образовательное учреждение города Москвы «Московский автомобильно-дорожный колледж имени А. А. Николаева»",
+                    "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ПРОФЕССИОНАЛЬНОЕ ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ ГОРОДА МОСКВЫ «МОСКОВСКИЙ АВТОМОБИЛЬНО-ДОРОЖНЫЙ КОЛЛЕДЖ ИМЕНИ А. А. НИКОЛАЕВА»",
+                    "ГБПОУ г. Москвы «Московский автомобильно-дорожный колледж им. А. А. Николаева»",
+                    "г. Москва Московский автомобильно-дорожный колледж им. А.А. Николаева",
+                ]
+            ),
+            (
+                "Школа 47 Калуга",
+                ("47",),
+                "ШКОЛА",
+                "Калуга",
+                [
+                    "Муниципальное бюджетное общеобразовательное учреждение «Средняя общеобразовательная школа № 47» города Калуги",
+                    "МУНИЦИПАЛЬНОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ «СРЕДНЯЯ ОБЩЕОБРАЗОВАТЕЛЬНАЯ ШКОЛА № 47» ГОРОДА КАЛУГИ",
+                    "МБОУ СОШ № 47 г. Калуги",
+                    'МБОУ ""СОШ №47"" г Калуга',
+                ]
+            ),
+            (
+                "Школа 1 Можайск",
+                ("1",),
+                "ШКОЛА",
+                "Можайск",
+                [
+                    "Муниципальное общеобразовательное учреждение «Средняя общеобразовательная школа № 1» г. Можайска",
+                    "МУНИЦИПАЛЬНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ «СРЕДНЯЯ ОБЩЕОБРАЗОВАТЕЛЬНАЯ ШКОЛА № 1» Г. МОЖАЙСКА",
+                    "МОУ СОШ № 1 г. Можайска",
+                    "МОУ Средняя общеобразовательная школа №1 г Можайск",
+                ]
+            ),
+        ]
+
+        for desc, expected_nums, expected_type, expected_city, variations in test_cases:
+            for variant in variations:
+                extracted_nums = numbers(variant)
+                self.assertEqual(extracted_nums, expected_nums, f"{desc}: {variant} numbers mismatch")
+                extracted_type = institution_type(variant, config)
+                self.assertEqual(extracted_type, expected_type, f"{desc}: {variant} type mismatch")
+                geo = extract_geography({"name": variant}, config)
+                self.assertEqual(geo["city"], expected_city, f"{desc}: {variant} city mismatch")
+                self.assertNotIn("КОНФЛИКТ_РЕГИОНА", geo["geo_flags"])
+                self.assertNotIn("КОНФЛИКТ_ГОРОДА", geo["geo_flags"])
