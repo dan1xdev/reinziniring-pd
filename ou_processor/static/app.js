@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let files = [], config = null, busy = false, currentJob = null, timer = null, registryTimer = null;
+let files = [], config = null, busy = false, currentJob = null, timer = null, registryTimer = null, licensesTimer = null;
 function showError(message) { $('error').textContent = message; $('error').hidden = !message; }
 function setBusy(value) { busy = value; $('controls').disabled = value; updateButton(); }
 function updateButton() {
@@ -11,7 +11,8 @@ function updateConnection() {
   $('connection').textContent = $('offline').checked ? 'Без новых запросов DaData'
     : $('token').value.trim() ? 'Ключ введён — проверим при обработке'
     : config?.token_saved ? 'Ключ сохранён в системе'
-    : config?.token_configured ? 'Ключ задан на сервере' : 'Нужен ключ DaData';
+    : config?.token_configured ? 'Ключ задан на сервере'
+    : 'Без ключа: обработка по реестру Рособрнадзора';
 }
 $('token').addEventListener('input', updateConnection);
 $('offline').addEventListener('change', updateConnection);
@@ -59,9 +60,7 @@ function encodeFile(file) {
 $('form').onsubmit = async e => {
   e.preventDefault();
   if (busy || !files.length) return;
-  if (!config.token_configured && !$('token').value.trim() && !$('offline').checked) {
-    $('settings').open = true; $('token').focus(); return showError('Введите API-ключ DaData в настройках подключения.');
-  }
+  // Ключ DaData не обязателен: без него обработка идёт по реестру Рособрнадзора.
   showError(''); setBusy(true); currentJob = null; $('cancel').hidden = true;
   $('result').hidden = true; $('progress-card').hidden = false;
   $('phase').textContent = 'Загружаем файлы'; $('progress').value = 0; $('percentage').textContent = '0%'; $('progress-note').textContent = 'Подготавливаем таблицы…';
@@ -112,7 +111,7 @@ function renderRegistry() {
   const state = config.registry_update;
   const date = config.registry_date;
   const dateText = date ? `${date.slice(6,8)}.${date.slice(4,6)}.${date.slice(0,4)}` : 'без даты';
-  $('registry').textContent = config.registry_ready ? `Локальный снимок: ${dateText}` : 'Локального снимка пока нет';
+  $('registry').textContent = config.registry_ready ? `Резервный снимок: ${dateText}` : 'Резервного снимка пока нет';
   $('registry').classList.toggle('bad', !config.registry_ready && state.phase === 'error');
   $('registry-progress').textContent = state.message + (config.registry_ready && ['checking','waiting','error'].includes(state.phase)
     ? ' Пока используется локальный снимок.' : '');
@@ -120,11 +119,23 @@ function renderRegistry() {
   clearTimeout(registryTimer);
   if (['checking','waiting'].includes(state.phase)) registryTimer = setTimeout(refreshRegistry, 1500);
 }
+function renderLicenses() {
+  const state = config.licenses_update || {};
+  const date = config.licenses_date;
+  const dateText = date ? `${date.slice(6,8)}.${date.slice(4,6)}.${date.slice(0,4)}` : 'без даты';
+  $('licenses').textContent = config.licenses_ready ? `Основной снимок: ${dateText}` : 'Основного снимка пока нет';
+  $('licenses').classList.toggle('bad', !config.licenses_ready && state.phase === 'error');
+  $('licenses-progress').textContent = state.message + (config.licenses_ready && ['checking','waiting','error'].includes(state.phase)
+    ? ' Пока используется локальный снимок.' : '');
+  $('licenses-retry').hidden = !state.retry_available || state.phase === 'ready';
+  clearTimeout(licensesTimer);
+  if (['checking','waiting'].includes(state.phase)) licensesTimer = setTimeout(refreshRegistry, 1500);
+}
 async function refreshRegistry() {
   try {
     const next = await request('/api/config');
     config = next;
-    updateConnection(); updateTokenNote(); renderRegistry(); updateButton();
+    updateConnection(); updateTokenNote(); renderRegistry(); renderLicenses(); updateButton();
   } catch (error) {
     $('registry-progress').textContent = 'Нет связи с приложением. Обновите страницу, когда сервер снова заработает.';
   }
@@ -136,6 +147,14 @@ $('registry-retry').onclick = async () => {
     await refreshRegistry();
   } catch (error) { $('registry-progress').textContent = 'Не удалось запустить проверку: ' + error.message; }
   finally { $('registry-retry').disabled = false; }
+};
+$('licenses-retry').onclick = async () => {
+  $('licenses-retry').disabled = true;
+  try {
+    await request('/api/licenses/retry', {method:'POST', headers:{'X-CSRF-Token':config.csrf}});
+    await refreshRegistry();
+  } catch (error) { $('licenses-progress').textContent = 'Не удалось запустить проверку: ' + error.message; }
+  finally { $('licenses-retry').disabled = false; }
 };
 $('forget-token').onclick = async () => {
   try {
@@ -169,7 +188,7 @@ async function init() {
     config = await request('/api/config');
     updateConnection();
     if (!config.token_configured) $('settings').open = true;
-    updateTokenNote(); renderRegistry();
+    updateTokenNote(); renderRegistry(); renderLicenses();
     updateButton();
     currentJob = sessionStorage.getItem('schools-job');
     if (currentJob) { const previous = await request('/api/jobs/' + currentJob).catch(() => null); if (previous) { setBusy(['running','cancelling'].includes(previous.status)); poll(); } else sessionStorage.removeItem('schools-job'); }

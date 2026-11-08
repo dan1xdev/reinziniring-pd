@@ -113,11 +113,19 @@ class UploadTests(unittest.TestCase):
     def test_filename_cannot_escape_upload_directory(self):
         self.assertEqual(unpack_uploads([upload('../../test.xlsx')])[0][0],'test.xlsx')
 
-    def test_missing_key_is_reported(self):
+    def test_without_key_processing_runs_by_registry(self):
+        # Ключ DaData не обязателен: обычная обработка идёт по реестру без обращений к DaData.
         with tempfile.TemporaryDirectory() as root:
-            app=Application(root,root,Path(root)/'cache.json')
-            with self.assertRaisesRegex(UserError,'API-ключ'):
-                app.start({'files':[upload()]})
+            app = Application(Path(root)/'runs', Path(root)/'registry', Path(root)/'cache.json')
+            job_id = app.start({'files':[school_upload()]})
+            self.assertIsInstance(job_id, str)
+            for _ in range(500):
+                if app.snapshot(job_id)['status'] != 'running':
+                    break
+                time.sleep(.01)
+            job = app.snapshot(job_id)
+            self.assertEqual(job['status'], 'done', job.get('error'))
+            self.assertTrue(any('DaData' in w and 'реестр' in w.lower() for w in job['warnings']))
 
     def test_job_failure_releases_worker(self):
         with tempfile.TemporaryDirectory() as root:

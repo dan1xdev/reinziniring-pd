@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
+import sys
 
 from openpyxl import Workbook
 
@@ -22,7 +24,7 @@ from .letters import (
 from .input import read_records
 from .normalization import normalize
 from .pipeline import process
-from .resolution import RegistrySearch, SearchCache, resolve
+from .resolution import LicenseSearch, RegistrySearch, SearchCache, resolve
 
 
 def aggregate(result):
@@ -224,7 +226,12 @@ def aggregate(result):
                 "Адрес отсутствует или есть противоречие — проверить"
             )
 
-        if candidate["source"] != "DaData":
+        if candidate["source"] == "Реестр лицензий":
+            notes.append(
+                "Адрес из реестра лицензий; "
+                "актуальность адреса не подтверждена"
+            )
+        elif candidate["source"] != "DaData":
             notes.append(
                 "Адрес реестра аккредитации; "
                 "актуальность юридического адреса "
@@ -312,18 +319,27 @@ def aggregate(result):
             students
         ),
         "Групп на проверку": len(review),
+        "Групп сопоставлено через реестр лицензий": sum(
+            bool(group["selected"])
+            and group["selected"]["source"] == "Реестр лицензий"
+            for group in groups
+        ),
         "Групп сопоставлено через DaData": sum(
             bool(group["selected"])
             and group["selected"]["source"] == "DaData"
             for group in groups
         ),
-        "Групп сопоставлено через реестр": sum(
+        "Групп сопоставлено через резервный реестр": sum(
             bool(group["selected"])
-            and group["selected"]["source"] != "DaData"
+            and group["selected"]["source"] not in {"DaData", "Реестр лицензий"}
             for group in groups
         ),
-        "Групп проверено по реестру": sum(
-            group["registry_used"]
+        "Групп проверено по реестру лицензий": sum(
+            bool(group.get("license_used"))
+            for group in groups
+        ),
+        "Групп проверено по резервному реестру": sum(
+            bool(group.get("registry_used"))
             for group in groups
         ),
         "Запросов DaData в этом запуске":
@@ -432,7 +448,8 @@ def save(result, output, overrides=None):
             ("reason", "Что уточнить"),
             ("top_candidates", "Первые три кандидата"),
             ("candidate_count", "Кандидатов"),
-            ("registry_used", "Проверен реестр"),
+            ("license_used", "Проверен реестр лицензий"),
+            ("registry_used", "Проверен резервный реестр"),
             ("registry_truncated", "Выдача ограничена"),
             ("group_id", "Группа"),
             ("record_ids", "Исходные записи"),
@@ -483,9 +500,24 @@ def save(result, output, overrides=None):
             "value": result["created_at_utc"],
         },
         {
-            "metric": "Дата снимка реестра",
+            "metric": "Дата снимка реестра лицензий",
+            "value": result["resolution"].get(
+                "license", {}
+            ).get(
+                "snapshot_date", ""
+            ),
+        },
+        {
+            "metric": "Дата снимка резервного реестра",
             "value": result["resolution"]["registry"].get(
                 "snapshot_date", ""
+            ),
+        },
+        {
+            "metric": "Реестр лицензий (основной источник)",
+            "value": (
+                "https://islod.obrnadzor.gov.ru/"
+                "opendata_licenses.html"
             ),
         },
         {
@@ -639,6 +671,14 @@ def main():
             / "registry_cache"
         ),
     )
+    parser.add_argument(
+        "--licenses",
+        type=Path,
+        default=(
+            Path(__file__).resolve().parents[2]
+            / "license_registry_cache"
+        ),
+    )
     parser.add_argument("--online", action="store_true")
     parser.add_argument("--ask-token", action="store_true")
 
@@ -685,14 +725,38 @@ def main():
         DaDataClient(token) if args.online else None,
     )
 
-    registry = RegistrySearch(args.registry, config=config)
+    # Основной источник - локальный индекс реестра лицензий Рособрнадзора.
+    # Если его нет, обработка всё равно выполняется: остаются DaData
+    # (если передан ключ) и резервный реестр аккредитации.
+    try:
+        licenses = LicenseSearch(args.licenses, config=config)
+    except (ValueError, OSError, KeyError, sqlite3.Error):
+        licenses = None
+        print(
+            "Реестр лицензий недоступен. Запустите: "
+            "python -m ou_processor.license_registry update",
+            file=sys.stderr,
+        )
 
     try:
-        resolve(result, api, registry, config=config)
+        registry = RegistrySearch(args.registry, config=config)
+    except (ValueError, OSError, KeyError, sqlite3.Error):
+        registry = None
+        print(
+            "Резервный реестр аккредитации недоступен. "
+            "Ненайденные учреждения сохранятся на листе «Проверить».",
+            file=sys.stderr,
+        )
+
+    try:
+        resolve(result, api, registry, config=config, licenses=licenses)
         aggregate(result)
         save(result, args.output)
     finally:
-        registry.connection.close()
+        if licenses is not None:
+            licenses.connection.close()
+        if registry is not None:
+            registry.connection.close()
 
     print(
         json.dumps(
@@ -702,11 +766,11 @@ def main():
         )
     )
 
-    return (
-        2
-        if result["full_summary"]["Ошибка или пропуск запроса"]
-        else 0
-    )
+    # Обычная обработка без ключа DaData считается успешной: запросы без
+    # ключа помечаются как пропущенные, но это не ошибка запуска.
+    if args.online and result["full_summary"]["Ошибка или пропуск запроса"]:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
