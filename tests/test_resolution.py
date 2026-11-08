@@ -1,9 +1,11 @@
 """Проверки идентификации и сохранности связей учеников с делами."""
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from ou_processor.resolution import choose, SearchCache, resolve
 from ou_processor.full_run import aggregate
+from ou_processor.pipeline import process
 from ou_processor.web import JobCancelled
 
 
@@ -187,6 +189,63 @@ class ResolutionTests(unittest.TestCase):
         c1_ranked = next(c for c in ranked if c['candidate_inn'] == '111')
         self.assertIn('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ', c1_ranked['reasons'])
 
+    # Три и более равных кандидата не позволяют выбрать оставшегося после отказа лидерам.
+    def test_insufficient_margin_never_selects_lower_ranked_candidate(self):
+        for count in (3, 4):
+            with self.subTest(candidate_count=count):
+                candidates = [candidate(inn=str(index)) for index in range(count)]
+                selected, ranked = choose(record(), candidates)
+                self.assertIsNone(selected)
+                self.assertFalse(any(c['eligible'] for c in ranked))
+                self.assertTrue(all('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ' in c['reasons'] for c in ranked))
+
+    # Резервный источник не подтверждает посторонний ИНН при неясности основного поиска.
+    def test_registry_cannot_override_ambiguous_primary_with_another_inn(self):
+        class API:
+            actual_requests = 0
+            requests = []
+
+            def search(self, *args):
+                return [candidate(inn='111'), candidate(inn='222')]
+
+        class Registry:
+            metadata = {}
+
+            def search(self, source_record):
+                return [{**candidate(inn='333'), 'source': 'Реестр аккредитации'}], False
+
+        result = {'records': [record(record_id='1')],
+                  'groups': [dict(group_id='g', record_ids=['1'])]}
+        resolve(result, API(), Registry(), progress=False)
+        self.assertIsNone(result['resolution']['groups'][0]['selected'])
+        self.assertEqual(result['resolution']['groups'][0]['status'], 'ПРОВЕРИТЬ_ОТРЫВ')
+
+    # Старый выпуск остаётся на проверке независимо от положения рядом с новым выпуском.
+    def test_old_graduation_is_not_confirmed_by_another_row_in_group(self):
+        config = json.loads((Path(__file__).resolve().parents[1] / 'config.json').read_text(encoding='utf-8'))
+
+        class API:
+            actual_requests = 0
+            requests = []
+
+            def search(self, *args):
+                return [candidate()]
+
+        for years in [('2025', '2020'), ('2020', '2025')]:
+            with self.subTest(years=years):
+                records = [dict(record_id=year, name='ГБОУ школа № 1', education='Среднее общее',
+                    city_raw='Москва', region_raw='Москва', year=year, formula_fields=[],
+                    student_name='Ученик ' + year, personal_file_number=year) for year in years]
+                result = process(records, config)
+                resolve(result, API(), None, progress=False, config=config)
+                aggregate(result)
+                by_year = {r['year']: r for r in result['records']}
+                self.assertEqual(by_year['2020']['resolution_status'], 'ПРОВЕРИТЬ_ПРАВОПРЕЕМСТВО')
+                self.assertEqual(by_year['2020']['resolved_inn'], '')
+                self.assertEqual(by_year['2025']['resolution_status'], 'СОПОСТАВЛЕНО')
+                self.assertEqual(result['schools'][0]['record_ids'], '2025')
+                self.assertEqual(result['review'][0]['record_ids'], '2020')
+
     def test_truncated_name_vetoes_auto_match(self):
         r = record(name='ГБОУ города Москвы «Школа № 1284', flags=['ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ'])
         c = candidate(inn='123', name='ГБОУ города Москвы «Школа № 1284»')
@@ -240,6 +299,21 @@ class ResolutionTests(unittest.TestCase):
         res3 = {'records': [r3], 'groups': [dict(group_id='g3', record_ids=['3'])]}
         resolve(res3, API(), None, progress=False)
         self.assertEqual(res3['resolution']['groups'][0]['status'], 'ПРОВЕРИТЬ_ПРАВОПРЕЕМСТВО')
+
+    # Несовпадение региона кандидата получает специальный статус проверки региона.
+    def test_candidate_region_mismatch_has_region_review_status(self):
+        class API:
+            actual_requests = 0
+            requests = []
+
+            def search(self, *args):
+                return [candidate(region='Калужская область')]
+
+        result = {'records': [record(record_id='1')],
+                  'groups': [dict(group_id='g', record_ids=['1'])]}
+        resolve(result, API(), None, progress=False)
+        self.assertEqual(result['resolution']['groups'][0]['status'], 'ПРОВЕРИТЬ_КОНФЛИКТ_РЕГИОНА')
+        self.assertIsNone(result['resolution']['groups'][0]['selected'])
 
     def test_user_examples_match_across_all_variations(self):
         # 10 организаций из реального примера пользователя во всех 4 вариантах написания
