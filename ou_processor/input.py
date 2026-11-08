@@ -86,10 +86,13 @@ def _check_damaged_cell(cell, value):
 
 
 def dedupe_personal_files(records, sources):
-    # Удаляет полные повторы, а конфликты помечает флагом input_conflict
+    # Координаты строки не влияют на повтор, но все данные для отбора и поиска — влияют.
+    fields = (set(ALIASES) - {"case_id", "original_row"}) | {"formula_fields", "input_flags", "damaged_fields"}
     by_number = {}
     unique_records = []
-    removed_count = 0
+    sources_by_id = {source["source_id"]: source for source in sources}
+    for source in sources:
+        source["duplicates_removed"] = 0
 
     for r in records:
         r["input_conflict"] = False 
@@ -99,27 +102,18 @@ def dedupe_personal_files(records, sources):
             unique_records.append(r)
             continue
             
-        if num not in by_number:
-            by_number[num] = r
-            unique_records.append(r)
-        else:
-            existing = by_number[num]
-            is_exact_duplicate = (
-                r.get("student_name") == existing.get("student_name") and
-                r.get("name") == existing.get("name") and
-                r.get("education") == existing.get("education") and
-                r.get("document") == existing.get("document")
-            )
-
-            if is_exact_duplicate:
-                removed_count += 1
-            else:
-                r["input_conflict"] = True
+        variants = by_number.setdefault(num, [])
+        if any(all(r.get(field) == existing.get(field) for field in fields) for existing in variants):
+            source = sources_by_id.get(r["record_id"].partition(":")[0])
+            if source is not None:
+                source["duplicates_removed"] += 1
+            continue
+        if variants:
+            r["input_conflict"] = True
+            for existing in variants:
                 existing["input_conflict"] = True
-                unique_records.append(r)
-
-    if sources:
-        sources[-1]["duplicates_removed"] = sources[-1].get("duplicates_removed", 0) + removed_count
+        variants.append(r)
+        unique_records.append(r)
 
     return unique_records
 
@@ -248,8 +242,9 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
             personal_file_number(cells[mapping["personal_file_number"]])
             if "personal_file_number" in mapping else ""
         )
-        if "postal_code_raw" in mapping:
-            record["postal_code_raw"] = personal_file_number(cells[mapping["postal_code_raw"]])
+        for field in ("postal_code_raw", "inn_raw"):
+            if field in mapping:
+                record[field] = personal_file_number(cells[mapping[field]])
             
         formula_fields = [field for field, index in mapping.items() if cells[index].data_type == "f"]
         for field in formula_fields:
@@ -257,16 +252,20 @@ def read_sheet(sheet, filename, source_id, should_cancel=None):
 
         # Проверяем ячейки на повреждение Excel
         input_flags = []
+        damaged_fields = []
         for field in DAMAGE_CHECK_FIELDS:
             if field in mapping:
                 index = mapping[field]
-                input_flags.extend(_check_damaged_cell(cells[index], cells[index].value))
+                cell_flags = _check_damaged_cell(cells[index], cells[index].value)
+                if cell_flags:
+                    input_flags.extend(cell_flags)
+                    damaged_fields.append(field)
 
             
         record.update({"record_id": f"{source_id}:{sheet.title}:{row_number}",
                        "source_file": filename, "source_sheet": sheet.title,
                        "source_row": row_number, "formula_fields": formula_fields,
-                       "input_flags": input_flags})
+                       "input_flags": input_flags, "damaged_fields": damaged_fields})
         records.append(record)
         
     if mapping is None:
