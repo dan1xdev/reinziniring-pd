@@ -217,24 +217,43 @@ def _repair_uppercase(name):
     return name, True
 
 
+def _repair_quotes(name):
+    # Внешние кавычки — ёлочки, вложенные — лапки; незакрытые пары закрываем в конце.
+    result, opened = [], []
+    for index, char in enumerate(name):
+        if char not in '«»„“”"':
+            result.append(char)
+            continue
+        if char in '«„':
+            opening = True
+        elif char in '»”' or (char == '“' and opened and opened[-1] == '„'):
+            opening = False
+        else:
+            following = name[index + 1:index + 2]
+            opening = not opened or (index > 0 and name[index - 1].isspace()
+                                     and bool(following) and following.isalnum())
+        if opening:
+            result.append('«' if len(opened) % 2 == 0 else '„')
+            opened.append(char)
+        elif opened:
+            opened.pop()
+            result.append('»' if len(opened) % 2 == 0 else '“')
+        else:
+            result.append(char)
+    while opened:
+        opened.pop()
+        result.append('»' if len(opened) % 2 == 0 else '“')
+    return ''.join(result)
+
+
 def official_typography(value):
     name = unicodedata.normalize("NFC", _value(value))
 
-    name = (
-        name.replace("„", "«")
-        .replace("“", "»")
-        .replace("”", "»")
-    )
-
-    name = re.sub(
-        r'"([^"\n]+)"',
-        lambda match: "«" + match.group(1).strip() + "»",
-        name,
-    )
+    name = _repair_quotes(name)
 
     name = re.sub(r"\s*№\s*(?=\d)", " № ", name)
-    name = re.sub(r"\s+([,.;:»])", r"\1", name)
-    name = re.sub(r"«\s+", "«", name)
+    name = re.sub(r"\s+([,.;:»“])", r"\1", name)
+    name = re.sub(r"([«„])\s+", r"\1", name)
     name = re.sub(r"\s+", " ", name).strip()
 
     name, adjusted = _repair_uppercase(name)
@@ -289,69 +308,77 @@ _NOUNS = {
 }
 
 
+_GENITIVE_FORMS = {**_GENITIVE_ADJECTIVES, **_NOUNS}
+_NOMINATIVE_FORMS = {genitive: nominative for nominative, genitive in _GENITIVE_FORMS.items()}
+_PROPER_WORD = r"[А-ЯЁ][а-яё]+(?:-[А-ЯЁа-яё]+)*"
+_PRESERVED_GENITIVE_TAIL = re.compile(
+    rf"(?:города|[Рр]еспублики)\s+{_PROPER_WORD}(?:\s+{_PROPER_WORD})*"
+    r"|[А-ЯЁ][а-яё-]*(?:ой|ого|его)\s+(?:области|края|[Рр]еспублики)"
+    r"|(?:(?:среднего|основного|начального|высшего|дополнительного|"
+    r"профессионального|общего|дошкольного)\s+)*образования"
+    r"|№\s*\d+"
+)
+
+
+def _preserved_tail_length(words, start):
+    # Не захватываем следующую именную часть, даже если она начинается с прописной буквы.
+    for length in range(min(5, len(words) - start), 0, -1):
+        tail = words[start:start + length]
+        if any(word.casefold() in _GENITIVE_FORMS for word in tail):
+            continue
+        if _PRESERVED_GENITIVE_TAIL.fullmatch(' '.join(tail)):
+            return length
+    return 0
+
+
+def _initial_case(form, original):
+    return form[0].upper() + form[1:] if original[0].isupper() else form
+
+
 def genitive_official_name(name):
     if not name:
         return "", False
 
     outside, separator, inside = name.partition("«")
     words = outside.strip().split()
+    converted = list(words)
+    changed = []
+    index, has_head = 0, False
 
-    head_idx = next(
-        (
-            index
-            for index, word in enumerate(words)
-            if word.casefold() in _NOUNS
-        ),
-        None,
-    )
-
-    if head_idx is None or head_idx > 9:
-        return "", False
-
-    converted = []
-
-    for word in words[:head_idx]:
-        if word in _ABBREVIATIONS:
-            converted.append(word)
+    while index < len(words):
+        preserved = _preserved_tail_length(words, index) if has_head else 0
+        if preserved:
+            index += preserved
             continue
-
-        if word.isupper():
+        # Склоняем только полную именную часть: известные определения и головное существительное.
+        while index < len(words) and (words[index] in _ABBREVIATIONS
+                                      or words[index].casefold() in _GENITIVE_ADJECTIVES):
+            word = words[index]
+            if word not in _ABBREVIATIONS:
+                if word.isupper():
+                    return "", False
+                converted[index] = _initial_case(_GENITIVE_FORMS[word.casefold()], word)
+                changed.append(index)
+            index += 1
+        if index == len(words) or words[index].casefold() not in _NOUNS or words[index].isupper():
             return "", False
+        converted[index] = _initial_case(_NOUNS[words[index].casefold()], words[index])
+        changed.append(index)
+        has_head = True
+        index += 1
 
-        changed = _GENITIVE_ADJECTIVES.get(word.casefold())
-
-        if changed is None:
+    # Обратная проверка изменённых слов по словарю; хвосты и цитируемое название не склоняются.
+    restored = list(converted)
+    for index in changed:
+        original_form = _NOMINATIVE_FORMS.get(converted[index].casefold())
+        if original_form is None:
             return "", False
-
-        if word[0].isupper():
-            changed = changed[0].upper() + changed[1:]
-
-        converted.append(changed)
-
-    head = words[head_idx]
-
-    if head.isupper():
+        restored[index] = _initial_case(original_form, converted[index])
+    if not has_head or restored != words:
         return "", False
-
-    new_head = _NOUNS[head.casefold()]
-
-    if head[0].isupper():
-        new_head = new_head[0].upper() + new_head[1:]
-
-    converted.append(new_head)
-
-    tail = " ".join(words[head_idx + 1:])
-
-    if tail and not re.fullmatch(r"№\s*\d+", tail):
-        return "", False
-
-    result = " ".join(
-        converted + ([tail] if tail else [])
-    )
-
+    result = ' '.join(converted)
     if separator:
         result += " «" + inside
-
     return result, True
 
 
