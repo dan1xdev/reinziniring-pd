@@ -228,7 +228,9 @@ def aggregate(result):
                 "Адрес отсутствует или есть противоречие — проверить"
             )
 
-        if candidate["source"] != "DaData":
+        if candidate["source"] == "Реестр лицензий":
+            notes.append("Адрес из реестра лицензий; актуальность адреса не подтверждена")
+        elif candidate["source"] != "DaData":
             notes.append(
                 "Адрес реестра аккредитации; "
                 "актуальность юридического адреса "
@@ -316,6 +318,11 @@ def aggregate(result):
             students
         ),
         "Групп на проверку": len(review),
+        "Групп сопоставлено через реестр лицензий": sum(
+            bool(group["selected"])
+            and group["selected"]["source"] == "Реестр лицензий"
+            for group in groups
+        ),
         "Групп сопоставлено через DaData": sum(
             bool(group["selected"])
             and group["selected"]["source"] == "DaData"
@@ -329,6 +336,9 @@ def aggregate(result):
         "Групп проверено по реестру": sum(
             group["registry_used"]
             for group in groups
+        ),
+        "Групп проверено по реестру лицензий": sum(
+            bool(group.get("license_used")) for group in groups
         ),
         "Запросов DaData в этом запуске":
             result["resolution"]["actual_requests"],
@@ -436,6 +446,7 @@ def save(result, output, overrides=None):
             ("reason", "Что уточнить"),
             ("top_candidates", "Первые три кандидата"),
             ("candidate_count", "Кандидатов"),
+            ("license_used", "Проверен реестр лицензий"),
             ("registry_used", "Проверен реестр"),
             ("registry_truncated", "Выдача ограничена"),
             ("group_id", "Группа"),
@@ -487,10 +498,18 @@ def save(result, output, overrides=None):
             "value": result["created_at_utc"],
         },
         {
+            "metric": "Дата снимка реестра лицензий",
+            "value": result["resolution"].get("license", {}).get("snapshot_date", ""),
+        },
+        {
             "metric": "Дата снимка реестра",
             "value": result["resolution"]["registry"].get(
                 "snapshot_date", ""
             ),
+        },
+        {
+            "metric": "Реестр лицензий (основной источник)",
+            "value": "https://islod.obrnadzor.gov.ru/opendata_licenses.html",
         },
         {
             "metric": "DaData",
@@ -653,6 +672,9 @@ def main(argv=None):
             / "registry_cache"
         ),
     )
+    parser.add_argument('--licenses', type=Path,
+                        default=Path(__file__).resolve().parents[2] / 'license_registry_cache',
+                        help='Локальный индекс основного реестра лицензий')
     parser.add_argument('--config', type=Path, default=Path(__file__).resolve().parents[1] / 'config.json')
     parser.add_argument('--sheet', help='Название рабочего листа во всех входных книгах')
     parser.add_argument('--list-sheets', action='store_true', help='Показать листы и завершить без обработки')
@@ -697,7 +719,8 @@ def main(argv=None):
         def progress(done, total):
             print(f'Обработано групп: {done}/{total}', file=sys.stderr, flush=True)
 
-        search(result, args.registry, config, cache=args.cache, client=client, on_progress=progress)
+        search(result, args.registry, config, licenses_path=args.licenses,
+               cache=args.cache, client=client, on_progress=progress)
         aggregate(result)
         save(result, args.output)
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, ParseError, InvalidFileException) as error:

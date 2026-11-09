@@ -21,6 +21,8 @@ from .dadata import DaDataClient
 from .key_storage import TokenStore
 from .full_run import aggregate, save
 from .input import list_sheets, read_records
+from .license_registry import auto_update as license_auto_update
+from .license_registry import current_snapshot as current_license_snapshot
 from .pipeline import process
 from .registry import current_snapshot
 from .registry_worker import RegistryWorker
@@ -74,8 +76,9 @@ def unpack_uploads(files, deduplicate=True):
 
 class Application:
     def __init__(self, storage, registry, cache, token='', client_factory=DaDataClient,
-                 token_store=None, registry_worker=None):
+                 token_store=None, registry_worker=None, licenses=None, licenses_worker=None):
         self.storage, self.registry, self.cache = Path(storage), Path(registry), Path(cache)
+        self.licenses = Path(licenses) if licenses else ROOT.parent / 'license_registry_cache'
         self.initial_token = token
         self.token, self.client_factory = token, client_factory
         self.token_store = token_store
@@ -90,6 +93,7 @@ class Application:
                 # Недоступное системное хранилище не мешает обработке с введённым ключом.
                 pass
         self.registry_worker = registry_worker or RegistryWorker(self.registry)
+        self.licenses_worker = licenses_worker or RegistryWorker(self.licenses, updater=license_auto_update)
         self.csrf = secrets.token_urlsafe(32)
         self.jobs = {}
         self.cancel_flags = {}
@@ -102,12 +106,22 @@ class Application:
         except (ValueError, OSError, KeyError):
             snapshot = None
         date = snapshot[1].get('snapshot_date', '') if snapshot else ''
+        try:
+            licenses_snapshot = current_license_snapshot(self.licenses)
+        except (ValueError, OSError, KeyError):
+            licenses_snapshot = None
+        licenses_date = licenses_snapshot[1].get('snapshot_date', '') if licenses_snapshot else ''
         return {'csrf': self.csrf, 'token_configured': bool(self.token), 'token_saved': self.token_saved,
                 'registry_ready': bool(snapshot), 'registry_date': date,
-                'registry_update': self.registry_worker.snapshot(), 'max_files': 10, 'max_mb': 100}
+                'registry_update': self.registry_worker.snapshot(),
+                'licenses_ready': bool(licenses_snapshot), 'licenses_date': licenses_date,
+                'licenses_update': self.licenses_worker.snapshot(), 'max_files': 10, 'max_mb': 100}
 
     def start_registry_update(self):
         return self.registry_worker.start()
+
+    def start_licenses_update(self):
+        return self.licenses_worker.start()
 
     def forget_token(self):
         if self.token_store:
@@ -133,15 +147,22 @@ class Application:
     def start(self, payload):
         if not isinstance(payload, dict):
             raise UserError('Некорректные параметры загрузки.')
-        uploaded = unpack_uploads(payload.get('files'))
+        supplied = unpack_uploads(payload.get('files'), deduplicate=False)
         mode = payload.get('mode', 'registry')
         if not isinstance(mode, str) or mode not in {'registry', 'dadata_check'}:
             raise UserError('Выберите обработку по реестру или отдельную сверку DaData.')
-        sheets = payload.get('sheets', {})
-        digests = {hashlib.sha256(content).hexdigest() for _, content in uploaded}
-        if (not isinstance(sheets, dict) or any(key not in digests or not isinstance(value, str)
-                or len(value) > 31 for key, value in sheets.items())):
+        sheets = payload.get('sheets', [''] * len(supplied))
+        if (not isinstance(sheets, list) or len(sheets) != len(supplied)
+                or any(not isinstance(value, str) or len(value) > 31 for value in sheets)):
             raise UserError('Не удалось прочитать выбор листов. Выберите файлы повторно.')
+        uploaded, selected_sheets, seen = [], [], set()
+        for (name, content), sheet in zip(supplied, sheets):
+            key = (hashlib.sha256(content).digest(), sheet)
+            if key in seen:
+                continue
+            seen.add(key)
+            uploaded.append((name, content))
+            selected_sheets.append(sheet)
         token = (payload.get('token') or self.token) if mode == 'dadata_check' else ''
         if not isinstance(token, str) or len(token) > 256 or '\n' in token or '\r' in token:
             raise UserError('Проверьте API-ключ DaData.')
@@ -166,7 +187,7 @@ class Application:
                                  'progress': 2, 'done': 0, 'total': 0, 'error': ''}
             self.cancel_flags[job_id] = threading.Event()
             self.active = job_id
-        thread = threading.Thread(target=self.run, args=(job_id, uploaded, token, mode, sheets), daemon=True)
+        thread = threading.Thread(target=self.run, args=(job_id, uploaded, token, mode, selected_sheets), daemon=True)
         thread.start()
         return job_id
 
@@ -223,7 +244,7 @@ class Application:
                 path = folder / name
                 path.write_bytes(content)
                 paths.append(path)
-                sheet_names[str(path.resolve())] = (sheets or {}).get(hashlib.sha256(content).hexdigest(), '')
+                sheet_names[str(path.resolve())] = sheets[index] if sheets else ''
             config = json.loads((ROOT / 'config.json').read_text())
             records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id), sheet_names=sheet_names)
             self.check_cancel(job_id)
@@ -232,10 +253,11 @@ class Application:
             result = process(records, config)
             self.check_cancel(job_id)
             result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
-            phase = 'Ищем в реестре и отдельно сверяем DaData' if mode == 'dadata_check' else 'Ищем организации в локальном реестре'
+            phase = 'Ищем в реестрах и отдельно сверяем DaData' if mode == 'dadata_check' else 'Ищем организации в локальных реестрах'
             self.change(job_id, phase=phase, progress=8, total=len(result['groups']))
             client = self.client_factory(token) if mode == 'dadata_check' else None
-            search(result, self.registry, config, cache=self.cache, client=client,
+            search(result, self.registry, config, licenses_path=self.licenses,
+                cache=self.cache, client=client,
                 on_progress=lambda done, total: self.progress(job_id, done, total),
                 check_cancel=lambda: self.check_cancel(job_id))
             self.check_cancel(job_id)
@@ -350,6 +372,8 @@ class Handler(BaseHTTPRequestHandler):
                              job or {'error': 'Задача не найдена.'})
         if self.path == '/api/registry/retry':
             return self.send(202, self.app.start_registry_update())
+        if self.path == '/api/licenses/retry':
+            return self.send(202, self.app.start_licenses_update())
         if self.path == '/api/token/forget':
             try:
                 self.app.forget_token()
@@ -377,6 +401,7 @@ def main():
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--storage', type=Path, default=ROOT.parent/'ui_runs')
     parser.add_argument('--registry', type=Path, default=ROOT.parent/'registry_cache')
+    parser.add_argument('--licenses', type=Path, default=ROOT.parent/'license_registry_cache')
     parser.add_argument('--cache', type=Path, default=ROOT.parent/'ui_cache'/'dadata.json')
     parser.add_argument('--ask-token', action='store_true')
     parser.add_argument('--no-browser', action='store_true')
@@ -387,13 +412,15 @@ def main():
         if existing.exists():
             args.cache.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(existing, args.cache)
-    app = Application(args.storage, args.registry, args.cache, token, token_store=TokenStore())
+    app = Application(args.storage, args.registry, args.cache, token,
+                      token_store=TokenStore(), licenses=args.licenses)
     try:
         server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     except OSError:
         parser.exit(1, 'Порт занят. Закройте старый экземпляр или укажите другой --port.\n')
     server.app = app
     app.start_registry_update()
+    app.start_licenses_update()
     url = f'http://127.0.0.1:{server.server_port}'
     print(f'Откройте {url}. Для остановки нажмите Ctrl+C.', flush=True)
     if not args.no_browser:

@@ -1,4 +1,4 @@
-"""Общий сценарий UI и CLI: реестр и отдельная диагностическая сверка DaData."""
+"""Общий сценарий UI и CLI: реестры и отдельная диагностическая сверка DaData."""
 
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -6,12 +6,13 @@ import json
 from pathlib import Path
 import sqlite3
 
-from .resolution import RegistrySearch, SearchCache, resolve
+from .resolution import LicenseSearch, RegistrySearch, SearchCache, resolve
 
 
-def search(result, registry_path, config, *, cache=None, client=None,
+def search(result, registry_path, config, *, licenses_path=None, cache=None, client=None,
            on_progress=None, check_cancel=None):
     registry = None
+    licenses = None
     warnings = []
     result['processing_mode'] = 'dadata_check' if client is not None else 'registry'
     total = len(result['groups']) * (2 if client is not None else 1)
@@ -20,18 +21,36 @@ def search(result, registry_path, config, *, cache=None, client=None,
         return lambda done, _: on_progress(done + offset, total) if on_progress else None
 
     try:
+        if licenses_path is not None:
+            try:
+                licenses = LicenseSearch(licenses_path, config=config)
+            except (ValueError, OSError, KeyError, sqlite3.Error):
+                warnings.append('Реестр лицензий недоступен. Запустите: python -m ou_processor.license_registry update. Используется резервный реестр аккредитации.')
         try:
             registry = RegistrySearch(registry_path, config=config)
         except (ValueError, OSError, KeyError, sqlite3.Error):
-            warnings.append('Локальный реестр недоступен. Несопоставленные учреждения переданы на проверку; автоматического обращения к DaData нет.')
+            warnings.append('Локальный реестр недоступен (резервный реестр аккредитации). Основной поиск по лицензиям продолжается; автоматического обращения к DaData нет.')
         try:
-            resolve(result, None, registry, progress=False, config=config,
+            resolve(result, None, registry, progress=False, config=config, licenses=licenses,
                     on_progress=report(0), check_cancel=check_cancel)
         except sqlite3.Error:
-            warnings.append('Не удалось прочитать индекс реестра. Учреждения переданы на проверку; обновите локальный реестр.')
-            resolve(result, None, None, progress=False, config=config,
-                    on_progress=report(0), check_cancel=check_cancel)
+            try:
+                resolve(result, None, None, progress=False, config=config, licenses=licenses,
+                        on_progress=report(0), check_cancel=check_cancel)
+            except sqlite3.Error:
+                warnings.append('Не удалось прочитать индекс реестра лицензий. Проверяем резервный реестр аккредитации.')
+                try:
+                    resolve(result, None, registry, progress=False, config=config,
+                            on_progress=report(0), check_cancel=check_cancel)
+                except sqlite3.Error:
+                    warnings.append('Не удалось прочитать индекс резервного реестра. Учреждения переданы на проверку; обновите локальные реестры.')
+                    resolve(result, None, None, progress=False, config=config,
+                            on_progress=report(0), check_cancel=check_cancel)
+            else:
+                warnings.append('Не удалось прочитать индекс резервного реестра. Сопоставления по лицензиям сохранены.')
     finally:
+        if licenses is not None:
+            licenses.connection.close()
         if registry is not None:
             registry.connection.close()
 
@@ -75,7 +94,9 @@ def write_log(result, destination):
             'group_id': group['group_id'], 'record_ids': group['record_ids'],
             'status': group['status'], 'selected_inn': selected.get('candidate_inn', ''),
             'source': selected.get('source', ''), 'source_url': selected.get('source_url', ''),
-            'score': selected.get('score'), 'registry_used': group['registry_used'],
+            'score': selected.get('score'), 'license_used': group.get('license_used', False),
+            'license_truncated': group.get('license_truncated', False),
+            'registry_used': group['registry_used'],
             'registry_truncated': group.get('registry_truncated', False),
             'candidates': [{k: c.get(k) for k in ('candidate_inn', 'source', 'source_url', 'score', 'eligible', 'reasons')}
                            for c in candidates.get(group['group_id'], [])],
@@ -85,6 +106,7 @@ def write_log(result, destination):
         'finished_at_utc': datetime.now(timezone.utc).isoformat(),
         'mode': result.get('processing_mode', 'registry'),
         'registry': result['resolution'].get('registry', {}),
+        'license': result['resolution'].get('license', {}),
         'sources': result.get('sources', []), 'summary': result.get('full_summary', {}),
         'warnings': result.get('warnings', []), 'groups': groups,
         'selection': [{k: r.get(k) for k in ('record_id', 'source_file', 'source_sheet', 'source_row',
