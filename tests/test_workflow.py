@@ -17,6 +17,7 @@ from openpyxl import Workbook, load_workbook
 
 from ou_processor.full_run import main
 from ou_processor.input import read_records
+from ou_processor.license_registry import update as update_licenses
 from ou_processor.pipeline import process
 from ou_processor.web import Application, UserError
 from ou_processor.workflow import search
@@ -59,6 +60,12 @@ class Registry:
         return [candidate()], False
 
 
+class Licenses(Registry):
+    metadata = {'snapshot_date': '20261109', 'source_kind': 'license_registry'}
+    def search(self, record):
+        return [candidate('2222222222', 'Реестр лицензий')], False
+
+
 def wait_job(app, job_id):
     for _ in range(500):
         job = app.snapshot(job_id)
@@ -69,6 +76,42 @@ def wait_job(app, job_id):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_license_is_primary_and_does_not_read_dadata(self):
+        with patch('ou_processor.workflow.LicenseSearch', Licenses), patch(
+                'ou_processor.workflow.RegistrySearch', Registry), patch(
+                'ou_processor.workflow.SearchCache', side_effect=AssertionError('Кэш DaData не нужен')):
+            calculated = search(result(), 'accreditation', CONFIG, licenses_path='licenses')
+        chosen = calculated['resolution']['groups'][0]['selected']
+        self.assertEqual(chosen['candidate_inn'], '2222222222')
+        self.assertEqual(chosen['source'], 'Реестр лицензий')
+        self.assertEqual(calculated['resolution']['requests'], [])
+        self.assertEqual(calculated['resolution']['license']['snapshot_date'], '20261109')
+
+    def test_broken_backup_does_not_erase_license_matches(self):
+        records = [dict(record_id=f's:Рабочий:{number}', source_file='input.xlsx',
+                        source_sheet='Рабочий', source_row=number, name=name,
+                        education='Среднее общее', formula_fields=[], student_name='Ученик',
+                        personal_file_number=str(number))
+                   for number, name in ((2, 'ГБОУ г. Москвы «Школа № 1»'),
+                                        (3, 'ГБОУ г. Москвы «Школа № 2»'))]
+
+        class PartialLicenses(Licenses):
+            def search(self, record):
+                return super().search(record) if '№ 1' in record['name'] else ([], False)
+
+        class BrokenBackup(Registry):
+            def search(self, record):
+                raise sqlite3.DatabaseError('broken backup')
+
+        with patch('ou_processor.workflow.LicenseSearch', PartialLicenses), patch(
+                'ou_processor.workflow.RegistrySearch', BrokenBackup):
+            calculated = search(process(records, CONFIG), 'accreditation', CONFIG, licenses_path='licenses')
+
+        selected = [group['selected'] for group in calculated['resolution']['groups']]
+        self.assertEqual([item['candidate_inn'] if item else '' for item in selected],
+                         ['2222222222', ''])
+        self.assertTrue(any('резервного реестра' in warning for warning in calculated['warnings']))
+
     def test_registry_does_not_read_dadata_cache_or_create_client(self):
         with patch('ou_processor.workflow.RegistrySearch', Registry), patch(
                 'ou_processor.workflow.SearchCache', side_effect=AssertionError('Кэш DaData не нужен')):
@@ -242,6 +285,70 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(book['Запросы DaData'].max_row, 1)
             finally:
                 book.close()
+
+    def test_cli_uses_license_registry_without_dadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'input.xlsx'
+            path.write_bytes(base64.b64decode(upload()['data']))
+            with patch('ou_processor.workflow.LicenseSearch', Licenses), patch(
+                    'ou_processor.workflow.RegistrySearch', side_effect=ValueError('нет резерва')), patch(
+                    'ou_processor.workflow.SearchCache', side_effect=AssertionError('DaData не нужен')), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                code = main([str(path), '--sheet', 'Рабочий', '--licenses', str(root / 'licenses'),
+                             '--registry', str(root / 'missing'), '--output', str(root / 'result')])
+            result = json.loads((root / 'result' / 'result.json').read_text())
+        self.assertEqual(code, 0)
+        self.assertEqual(result['schools'][0]['inn'], '2222222222')
+        self.assertEqual(result['schools'][0]['source'], 'Реестр лицензий')
+
+    def test_ui_uses_license_registry_without_dadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = Application(root / 'runs', root / 'registry', root / 'cache.json',
+                              licenses=root / 'licenses', client_factory=lambda _: self.fail('DaData не нужен'))
+            with patch('ou_processor.workflow.LicenseSearch', Licenses), patch(
+                    'ou_processor.workflow.RegistrySearch', side_effect=ValueError('нет резерва')):
+                job_id = app.start({'files': [upload()], 'sheets': ['Рабочий']})
+                job = wait_job(app, job_id)
+            self.assertEqual(job['status'], 'done', job.get('error'))
+            result = json.loads((root / 'runs' / job_id / 'result' / 'result.json').read_text())
+        self.assertEqual(result['schools'][0]['inn'], '2222222222')
+
+    def test_real_license_snapshot_is_used_by_cli_and_ui(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            export = root / 'licenses.zip'
+            xml = ('<OpenData><Licenses><License><LicenseRegNumber>Л035-1</LicenseRegNumber>'
+                   '<FullName>Тестовая школа № 1</FullName><INN>0000000001</INN>'
+                   '<OGRN>0000000000001</OGRN><DateStart>2026-01-15</DateStart>'
+                   '<StatusName>Действующая</StatusName><RegionName>Москва</RegionName>'
+                   '<PostAddress>г Москва, улица Тестовая, д 1</PostAddress>'
+                   '</License></Licenses></OpenData>')
+            with zipfile.ZipFile(export, 'w') as archive:
+                archive.writestr('licenses.xml', xml)
+            licenses = root / 'licenses'
+            update_licenses(licenses, settings={'source_file': str(export), 'source_page': '', 'update_days': 0})
+            book = Workbook()
+            book.active.title = 'Рабочий'
+            book.active.append(['Образовательное учреждение', 'Вид образования', 'Регион', 'Город'])
+            book.active.append(['Тестовая школа № 1', 'Среднее общее', 'Москва', 'Москва'])
+            path = root / 'input.xlsx'
+            book.save(path)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                code = main([str(path), '--licenses', str(licenses), '--registry', str(root / 'missing'),
+                             '--output', str(root / 'cli-result')])
+            cli_result = json.loads((root / 'cli-result' / 'result.json').read_text())
+            self.assertEqual(code, 0)
+            self.assertEqual(cli_result['schools'][0]['inn'], '0000000001')
+
+            app = Application(root / 'ui-runs', root / 'missing', root / 'cache.json',
+                              licenses=licenses, client_factory=lambda _: self.fail('DaData не нужен'))
+            uploaded = {'name': 'input.xlsx', 'data': base64.b64encode(path.read_bytes()).decode()}
+            job_id = app.start({'files': [uploaded], 'sheets': ['Рабочий']})
+            job = wait_job(app, job_id)
+            self.assertEqual(job['status'], 'done', job.get('error'))
+            ui_result = json.loads((root / 'ui-runs' / job_id / 'result' / 'result.json').read_text())
+            self.assertEqual(ui_result['schools'][0]['inn'], '0000000001')
 
     def test_cli_missing_sheet_returns_clear_error_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
