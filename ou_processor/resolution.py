@@ -410,7 +410,9 @@ class LicenseSearch:
             if duplicate in seen:
                 continue
             seen.add(duplicate)
-            active = 'действ' in (row['status'] or '').casefold()
+            active = (row['status'] or '').strip().casefold() in {
+                'действующая', 'действует', 'действующее'
+            }
             result.append({'candidate_inn': row['inn'], 'candidate_ogrn': row['ogrn'],
                 'candidate_name': row['full_name'], 'short_name': row['short_name'],
                 'address': row['address'] or '', 'region': row['region'] or '', 'city': '',
@@ -484,6 +486,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
         found = []
         selected, ranked = None, []
         license_used, license_truncated = False, False
+        license_inns = set()
         if licenses is not None:
             if check_cancel:
                 check_cancel()
@@ -492,17 +495,22 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             chosen, license_ranked = choose(record, licensed, cfg)
             if chosen and not license_truncated:
                 selected = chosen
+            license_inns = {c['candidate_inn'] for c in license_ranked if c['candidate_inn'] and
+                            (c['eligible'] or 'НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ' in c['reasons'])}
             ranked.extend(license_ranked)
-        for query in queries(record, cfg) if api is not None and not selected else []:
-            if check_cancel:
-                check_cancel()
-            found.extend(api.search(query, group['group_id']))
-            if check_cancel:
-                check_cancel()
-            selected, api_ranked = choose(record, found, cfg)
-            ranked.extend(api_ranked)
-            if selected:
-                break
+        if not selected and api is not None:
+            da_ranked = []
+            for query in queries(record, cfg):
+                if check_cancel:
+                    check_cancel()
+                found.extend(api.search(query, group['group_id']))
+                if check_cancel:
+                    check_cancel()
+                proposed, da_ranked = choose(record, found, cfg)
+                if proposed and (not license_inns or proposed['candidate_inn'] in license_inns):
+                    selected = proposed
+                    break
+            ranked.extend(da_ranked)
         registry_used, truncated = False, False
         if not selected and registry is not None:
             if check_cancel:
@@ -513,7 +521,8 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             # Недостаточный отрыв сохраняет возможные ИНН основного поиска.
             primary_inns = {c['candidate_inn'] for c in ranked if c['eligible'] or
                             c['reasons'] == ['НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ']}
-            if chosen and not truncated and (not primary_inns or chosen['candidate_inn'] in primary_inns):
+            if chosen and not truncated and (not primary_inns or chosen['candidate_inn'] in primary_inns) \
+                    and (not license_inns or chosen['candidate_inn'] in license_inns):
                 selected = chosen
             ranked.extend(reserve_ranked)
 
@@ -546,11 +555,13 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             'registry_used': registry_used, 'registry_truncated': truncated,
             'candidate_count': len(unique)})
         if progress:
-            print(f"{index}/{len(result['groups'])}: {status}; DaData={api.actual_requests if api else 0}", flush=True)
+            requests_count = api.actual_requests if api is not None else 0
+            print(f"{index}/{len(result['groups'])}: {status}; DaData={requests_count}", flush=True)
         if on_progress:
             on_progress(index, len(result['groups']))
-    result['resolution'] = {'groups': resolutions, 'candidates': candidates, 'requests': api.requests if api else [],
-                            'actual_requests': api.actual_requests if api else 0,
+    result['resolution'] = {'groups': resolutions, 'candidates': candidates,
+                            'requests': api.requests if api is not None else [],
+                            'actual_requests': api.actual_requests if api is not None else 0,
                             'license': licenses.metadata if licenses is not None else {},
                             'registry': registry.metadata if registry is not None else {}}
     return result
