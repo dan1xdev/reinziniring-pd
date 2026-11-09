@@ -1,6 +1,7 @@
 """Чтение двух предоставленных форматов без использования аналитической разметки."""
 
 import hashlib
+import json
 import datetime
 from pathlib import Path
 
@@ -9,27 +10,16 @@ from openpyxl import load_workbook
 from .normalization import normalize, text
 
 
-ALIASES = {
-    "name": ["Образовательное учреждение", "Название ОУ в исходном Excel"],
-    "education": ["Вид образования"],
-    "document": ["Тип документа об образовании"],
-    "region_raw": ["Регион (как в файле)", "Регион", "Регион ОУ", "Регион образовательного учреждения"],
-    "location_raw": ["Местонахождение ОУ", "Местонахождение"],
-    "city_raw": ["Населённый пункт", "Населенный пункт", "Город"],
-    "year": ["Год завершения", "Год окончания"],
-    "case_id": ["ID"],
-    "original_row": ["Строка в Excel"],
-    "inn_raw": ["ИНН", "ИНН ОУ", "ИНН образовательного учреждения" ],
-    "personal_file_number": ["Личное дело.Номер", "Номер личного дела", "Личное дело"],
-    "student_name": ["ФИО", "ФИО ученика", "ФИО поступающего"],
-    "school_address_raw": ["Адрес", "Адрес ОУ", "Адрес школы", "Адрес образовательного учреждения", "Юридический адрес"],
-    "postal_code_raw": ["Индекс", "Почтовый индекс"],
-    "official_name_raw": ["Полное название ОУ в именительном падеже"],
-    "genitive_name_raw": ["Название ОУ в родительном падеже"],
-    "specialty_code": ["Код специальности", "Код направления"],
-}
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+ALIASES = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))["input_column_aliases"]
 
-REQUIRED_GROUPS = [("name",), ("education", "document")]
+
+def column_aliases(config=None):
+    # Переопределение отдельных полей не отменяет остальные стандартные колонки.
+    return {**ALIASES, **(config or {}).get("input_column_aliases", {})}
+
+
+REQUIRED_GROUPS = [("name",), ("student_name",)]
 
 REQUIRED_LABELS = {
     "name": "Образовательное учреждение",
@@ -87,9 +77,9 @@ def _check_damaged_cell(cell, value):
     return flags
 
 
-def dedupe_personal_files(records, sources):
+def dedupe_personal_files(records, sources, config=None):
     # Координаты строки не влияют на повтор, но все данные для отбора и поиска — влияют.
-    fields = (set(ALIASES) - {"case_id", "original_row"}) | {"formula_fields", "input_flags", "damaged_fields"}
+    fields = (set(column_aliases(config)) - {"case_id", "original_row"}) | {"formula_fields", "input_flags", "damaged_fields"}
     by_number = {}
     unique_records = []
     sources_by_id = {source["source_id"]: source for source in sources}
@@ -143,9 +133,10 @@ def list_sheets(path):
         workbook.close()
 
 
-def read_records(paths, should_cancel=None, sheet_name=None, sheet_names=None):
+def read_records(paths, should_cancel=None, sheet_name=None, sheet_names=None, config=None):
     records, sources = [], []
     seen_paths = set()
+    sheets_by_path = {Path(path).expanduser().resolve(): name for path, name in (sheet_names or {}).items()}
     
     for filename in paths:
         if should_cancel:
@@ -154,7 +145,7 @@ def read_records(paths, should_cancel=None, sheet_name=None, sheet_names=None):
         if path in seen_paths:
             continue
         seen_paths.add(path)
-        selected_sheet = (sheet_names or {}).get(str(path), sheet_name)
+        selected_sheet = sheets_by_path.get(path, sheet_name)
         
         if path.suffix.lower() != ".xlsx":
             raise ValueError(f"Поддерживается .xlsx: {path.name}")
@@ -176,7 +167,7 @@ def read_records(paths, should_cancel=None, sheet_name=None, sheet_names=None):
                         continue
                     requested_sheet_found = True
                 else:
-                    if "100 записей" in workbook.sheetnames and sheet.title != "100 записей":
+                    if count:
                         skipped.append(sheet.title)
                         continue
                     if sheet.title in SERVICE_SHEETS:
@@ -188,10 +179,13 @@ def read_records(paths, should_cancel=None, sheet_name=None, sheet_names=None):
                         skipped.append(sheet.title)
                         continue
 
-                found, info = read_sheet(sheet, path.name, source_id, should_cancel, source_path=str(path))
-                if found is None:
+                found, info = read_sheet(
+                    sheet, path.name, source_id, should_cancel, source_path=str(path), config=config,
+                )
+                if not found:
                     skipped.append(sheet.title)
-                    diagnostics.append(info)
+                    if found is None:
+                        diagnostics.append(info)
                     continue
                 records.extend(found)
                 count += len(found)
@@ -212,17 +206,18 @@ def read_records(paths, should_cancel=None, sheet_name=None, sheet_names=None):
                         "rows": count, "selected_sheet": selected_sheet or "Автоматически",
                         "skipped_sheets": skipped, "duplicates_removed": 0})
 
-    records = dedupe_personal_files(records, sources)
+    records = dedupe_personal_files(records, sources, config=config)
 
     return records, sources
 
 
-def read_sheet(sheet, filename, source_id, should_cancel=None, source_path=""):
+def read_sheet(sheet, filename, source_id, should_cancel=None, source_path="", config=None):
     mapping = None
     records = []
     seen = {}
     header_found = False
     header_row_number = None
+    aliases_by_field = column_aliases(config)
     
     for row_number, cells in enumerate(sheet.iter_rows(), 1):
         if should_cancel and row_number % 100 == 1:
@@ -235,7 +230,7 @@ def read_sheet(sheet, filename, source_id, should_cancel=None, source_path=""):
                 
             headers = [normalize(value) for value in values]
             candidate = {}
-            for field, aliases in ALIASES.items():
+            for field, aliases in aliases_by_field.items():
                 indices = [i for i, header in enumerate(headers)
                            if header in {normalize(alias) for alias in aliases}]
                 if len(indices) > 1:
@@ -247,7 +242,7 @@ def read_sheet(sheet, filename, source_id, should_cancel=None, source_path=""):
                     candidate[field] = indices[0]
                     seen[field] = values[indices[0]]
                     
-            if "name" in candidate and ("education" in candidate or "document" in candidate):
+            if all(any(field in candidate for field in group) for group in REQUIRED_GROUPS):
                 mapping = candidate
                 header_found = True
                 header_row_number = row_number
@@ -260,7 +255,10 @@ def read_sheet(sheet, filename, source_id, should_cancel=None, source_path=""):
         cleaned_values = {}
         for field, index in mapping.items():
             val = values[index]
-            if isinstance(val, float) and val == int(val):
+            if field == "specialty_code" and isinstance(val, (datetime.datetime, datetime.date)):
+                # Excel мог превратить 09.03.01 в дату; восстанавливаем текст только для кода.
+                cleaned_values[field] = val.strftime("%d.%m.%y")
+            elif isinstance(val, float) and val == int(val):
                 cleaned_values[field] = str(int(val))
             else:
                 cleaned_values[field] = val

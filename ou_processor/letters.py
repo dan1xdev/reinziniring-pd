@@ -5,15 +5,22 @@ import unicodedata
 
 
 LETTER_COLUMNS = [
-    ("status", "Готовность"),
-    ("letter_type", "Вид письма"),
-    ("inn", "Подтверждённый ИНН"),
+    ("letter_number", "Номер письма"),
     ("official_name", "Официальное название"),
     ("genitive_name", "Название в родительном падеже"),
-    ("students", "Поступившие"),
-    ("student_count", "Количество поступивших"),
     ("postal_code", "Почтовый индекс"),
     ("address", "Адрес без индекса"),
+    ("region", "Регион"),
+    ("students", "Поступившие"),
+    ("student_count", "Количество поступивших"),
+    ("match_status", "Статус сопоставления"),
+    ("status", "Готовность"),
+    ("inn", "ИНН"),
+    ("ogrn", "ОГРН"),
+    ("source_names", "Варианты исходного названия"),
+    ("flags", "Признаки риска"),
+    ("operator_comment", "Комментарий оператора"),
+    ("letter_type", "Вид письма"),
     ("mailing_address", "Адрес для письма"),
     ("source", "Источник"),
     ("source_url", "Ссылка на источник"),
@@ -596,7 +603,7 @@ def _prepare_one(inn, groups, students, override=None):
         "inn": inn,
         "official_name": official_name,
         "genitive_name": genitive,
-        "students": "\n".join(people),
+        "students": ", ".join(people),
         "student_count": len(people),
         "postal_code": code,
         "address": address,
@@ -689,11 +696,13 @@ def prepare_letters(result, overrides=None):
             for member in members
         ]
 
-        row = _prepare_one("", [group], students)
-
-        row["official_name"] = _value(
-            group.get("source_name")
-        )
+        proposal = group.get('review_candidate')
+        proposed_group = {**group, 'selected': proposal} if proposal else group
+        row = _prepare_one(proposal['candidate_inn'] if proposal else '', [proposed_group], students)
+        row['status'] = 'Проверить'
+        if not proposal:
+            row['official_name'] = _value(group.get('source_name'))
+        row['checks'] += '\n' + group.get('decision_reason', 'ИНН требует подтверждения')
 
         row["checks"] += (
             "\nНельзя объединять записи без "
@@ -720,6 +729,32 @@ def prepare_letters(result, overrides=None):
 
     ready.sort(key=sort_key)
     review.sort(key=sort_key)
+
+    groups_by_record = {
+        record_id: group for group in result.get('resolution', {}).get('groups', [])
+        for record_id in group.get('record_ids', [])
+    }
+    for number, row in enumerate(ready + review, 1):
+        ids = row['source_record_ids'].splitlines()
+        members = [by_id[i] for i in ids if i in by_id]
+        groups = [groups_by_record[i] for i in ids if i in groups_by_record]
+        selected = [g.get('selected') or g.get('review_candidate') for g in groups if g.get('selected') or g.get('review_candidate')]
+        regions = {c.get('region') for c in selected if c.get('region')}
+        ogrns = {c.get('candidate_ogrn') for c in selected if c.get('candidate_ogrn')}
+        statuses = {g.get('status', '') for g in groups}
+        match_status = ('АВТО' if row['inn'] and statuses <= {'АВТО', 'СОПОСТАВЛЕНО'}
+                        else 'ПРОВЕРИТЬ' if statuses == {'ПРОВЕРИТЬ'} else 'ВРУЧНАЯ')
+        flags = {flag for r in members for flag in r.get('flags', [])}
+        if not row['postal_code']:
+            flags.add('НЕТ_ИНДЕКСА')
+        if 'Регистр восстановлен' in row['checks']:
+            flags.add('РЕГИСТР_ВОССТАНОВЛЕН')
+        row.update(letter_number=number, region=next(iter(regions)) if len(regions) == 1 else '',
+                   ogrn=next(iter(ogrns)) if len(ogrns) == 1 else '',
+                   match_status=match_status,
+                   source_names=' || '.join(sorted({r['name'] for r in members})),
+                   flags='; '.join(sorted(flags)),
+                   operator_comment='')
 
     result["letters_ready"] = ready
     result["letters_review"] = review

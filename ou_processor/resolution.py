@@ -1,4 +1,4 @@
-"""Поиск по реестру лицензий и резервному реестру; DaData — отдельная сверка."""
+"""Каскад реестра лицензий и DaData с проверкой согласованности ИНН."""
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -97,8 +97,16 @@ def convert(suggestion, query):
 class SearchCache:
     def __init__(self, path, client=None):
         self.path = Path(path)
+        self.max_requests = 10000
         self.client = client
-        self.entries = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        self.warning = ''
+        try:
+            self.entries = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else {}
+            if not isinstance(self.entries, dict):
+                raise ValueError('Ожидался словарь')
+        except (OSError, ValueError):
+            self.entries = {}
+            self.warning = 'Кэш DaData повреждён или недоступен; результаты запрашиваются повторно.'
         self.requests = []
         self.actual_requests = 0
         self.stopped = ''
@@ -109,6 +117,8 @@ class SearchCache:
         if entry is None:
             if not self.client:
                 entry = {'status': 'НЕТ_В_КЭШЕ', 'candidates': []}
+            elif self.actual_requests >= self.max_requests:
+                entry = {'status': 'ЛИМИТ_ПРОГОНА', 'candidates': []}
             elif self.stopped:
                 entry = {'status': 'ПРОПУЩЕНО_' + self.stopped, 'candidates': []}
             else:
@@ -141,6 +151,7 @@ def geography_matches(expected, candidate):
 
 
 def assess(record, candidate, config=None):
+    candidate = {key: '' if value is None else value for key, value in candidate.items()}
     cfg = config or _DEFAULT_CONFIG
     scoring_cfg = cfg.get("scoring", {})
     weights = scoring_cfg.get("weights", {
@@ -162,7 +173,7 @@ def assess(record, candidate, config=None):
         "branch_risk": 20.0
     })
     thresholds = scoring_cfg.get("thresholds", {
-        "auto_match_min_score": 85.0,
+        "auto_match_min_score": 90.0,
         "candidate_margin": 15.0,
         "numbered_city_min_score": 95.0,
         "distinctive_overlap_threshold": 0.85
@@ -205,6 +216,10 @@ def assess(record, candidate, config=None):
     # Филиалы
     if candidate.get('branch_type') not in {'MAIN', '', None}:
         reasons.append('ФИЛИАЛ_ТРЕБУЕТ_ПРОВЕРКИ')
+
+    for flag in ('РЕГИОН_НЕ_ОПРЕДЕЛЕН', 'УСТАРЕВШЕЕ_НАИМЕНОВАНИЕ', 'НЕИЗВЕСТНАЯ_АББРЕВИАТУРА'):
+        if flag in record.get('flags', []):
+            reasons.append(flag)
 
     # Географическое соответствие
     for field in ('region', 'city'):
@@ -299,7 +314,7 @@ def assess(record, candidate, config=None):
 
         score = round(max(0.0, min(100.0, raw_score)), 1)
 
-    auto_min = thresholds.get("auto_match_min_score", 85.0)
+    auto_min = thresholds.get("auto_match_min_score", 90.0)
     eligible = bool(identity and not reasons and score >= auto_min)
 
     return {**candidate, 'score': score, 'reasons': sorted(set(reasons)), 'eligible': eligible}
@@ -308,7 +323,7 @@ def assess(record, candidate, config=None):
 def choose(record, candidates, config=None):
     cfg = config or _DEFAULT_CONFIG
     thresholds = cfg.get("scoring", {}).get("thresholds", {
-        "auto_match_min_score": 85.0,
+        "auto_match_min_score": 90.0,
         "candidate_margin": 15.0
     })
     ranked = [assess(record, c, cfg) for c in candidates]
@@ -399,7 +414,7 @@ class LicenseSearch:
                 condition += ' AND region IN (' + ','.join('?' for _ in region_options) + ')'
                 parameters += region_options
             rows = self.connection.execute('SELECT DISTINCT inn, ogrn, full_name, short_name, license_number, '
-                'status, date_start, region, address FROM licenses WHERE ' + condition +
+                'status, date_start, region, address, education_levels FROM licenses WHERE ' + condition +
                 ' ORDER BY date_start DESC LIMIT 2001', parameters).fetchall()
             self.cache[key] = [dict(row) for row in rows]
         found = self.cache[key]
@@ -419,7 +434,8 @@ class LicenseSearch:
                 'postal_code': (re.search(r'\b\d{6}\b', row['address'] or '') or [''])[0],
                 'legal_status': 'Действующее' if active else (row['status'] or 'статус неизвестен'),
                 'branch_type': '', 'source': 'Реестр лицензий', 'source_url': LICENSE_SOURCE_PAGE,
-                'certificate_id': row['license_number'], 'issue_date': row['date_start']})
+                'certificate_id': row['license_number'], 'issue_date': row['date_start'],
+                'license_status': row['status'], 'legal_status_source': 'Статус лицензии', 'education_levels': json.loads(row['education_levels'] or '[]')})
         return result, len(found) > 2000
 
 
@@ -475,6 +491,31 @@ class RegistrySearch:
         return result, len(found) > 2000
 
 
+def acceptance_status(selected, ranked, record, config):
+    """Предложение оператору не считается подтверждённым сопоставлением."""
+    if selected:
+        return 'АВТО'
+    if not ranked:
+        return 'НЕ_НАЙДЕНО'
+    thresholds = config.get('scoring', {}).get('thresholds', {})
+    best = {}
+    for candidate in ranked:
+        inn = candidate.get('candidate_inn')
+        if inn and (inn not in best or candidate['score'] > best[inn]['score']):
+            best[inn] = candidate
+    ordered = sorted(best.values(), key=lambda c: c['score'], reverse=True)
+    if not ordered:
+        return 'ВРУЧНАЯ'
+    first = ordered[0]
+    margin = first['score'] - ordered[1]['score'] if len(ordered) > 1 else first['score']
+    if (not set(first.get('reasons', [])) - {'НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ'}
+            and not set(record.get('flags', [])) & {'ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ', 'КОНФЛИКТ_РЕГИОНА', 'ПОДРАЗДЕЛЕНИЕ_ВУЗА', 'УСТАРЕВШЕЕ_НАИМЕНОВАНИЕ', 'СТАРЫЙ_ВЫПУСК', 'РЕГИОН_НЕ_ОПРЕДЕЛЕН', 'НЕИЗВЕСТНАЯ_АББРЕВИАТУРА'}
+            and first['score'] >= thresholds.get('review_match_min_score', 75)
+            and margin >= thresholds.get('review_candidate_margin', 10)):
+        return 'ПРОВЕРИТЬ'
+    return 'ВРУЧНАЯ'
+
+
 def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, config=None, licenses=None):
     cfg = config or _DEFAULT_CONFIG
     by_id = {r['record_id']: r for r in result['records']}
@@ -498,19 +539,6 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             license_inns = {c['candidate_inn'] for c in license_ranked if c['candidate_inn'] and
                             (c['eligible'] or 'НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ' in c['reasons'])}
             ranked.extend(license_ranked)
-        if not selected and api is not None:
-            da_ranked = []
-            for query in queries(record, cfg):
-                if check_cancel:
-                    check_cancel()
-                found.extend(api.search(query, group['group_id']))
-                if check_cancel:
-                    check_cancel()
-                proposed, da_ranked = choose(record, found, cfg)
-                if proposed and (not license_inns or proposed['candidate_inn'] in license_inns):
-                    selected = proposed
-                    break
-            ranked.extend(da_ranked)
         registry_used, truncated = False, False
         if not selected and registry is not None:
             if check_cancel:
@@ -526,13 +554,79 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
                 selected = chosen
             ranked.extend(reserve_ranked)
 
+        conflict = ''
+        unverified = None
+        dadata_check = None
+        if api is not None:
+            if selected:
+                # По ИНН уточняем адрес и статус, не заменяя образовательные атрибуты.
+                if check_cancel:
+                    check_cancel()
+                auxiliary = api.search(selected['candidate_inn'], group['group_id'])
+                matching = [c for c in auxiliary if c['candidate_inn'] == selected['candidate_inn']]
+                primary_inn = selected['candidate_inn']
+                if auxiliary and not matching:
+                    conflict = 'КОНФЛИКТ_ИНН'
+                elif matching:
+                    active = [c for c in matching if c['legal_status'] == 'ACTIVE' and c.get('branch_type') in ('MAIN', '', None)]
+                    if not active:
+                        conflict = 'РЕОРГАНИЗАЦИЯ'
+                    else:
+                        extra = active[0]
+                        enriched = {**selected, **{k: extra.get(k, '') for k in
+                            ('address', 'postal_code', 'region', 'city', 'candidate_ogrn', 'candidate_kpp', 'legal_status')},
+                            'address_source': 'DaData', 'legal_status_source': 'DaData'}
+                        checked = assess(record, enriched, cfg)
+                        if checked['eligible'] and len({c.get('address', '') for c in active}) == 1:
+                            selected = checked
+                        else:
+                            conflict = 'ПРОТИВОРЕЧИЕ_РЕКВИЗИТОВ'
+                            ranked.append(checked)
+                dadata_check = {'group_id': group['group_id'], 'registry_inn': primary_inn,
+                                'dadata_inn': (matching or auxiliary)[0]['candidate_inn'] if auxiliary else '',
+                                'status': conflict or ('СОВПАДАЕТ' if matching else 'ТРЕБУЕТ_ПРОВЕРКИ')}
+                ranked.extend(assess(record, c, cfg) for c in auxiliary)
+                if conflict:
+                    selected = None
+                elif not matching:
+                    unverified, selected = selected, None
+            else:
+                found = []
+                da_ranked = []
+                proposed = None
+                for query in queries(record, cfg):
+                    if check_cancel:
+                        check_cancel()
+                    found.extend(api.search(query, group['group_id']))
+                    proposed, da_ranked = choose(record, found, cfg)
+                    if proposed:
+                        # DaData без подтверждения реестром остаётся предложением оператору.
+                        if license_inns and proposed['candidate_inn'] not in license_inns:
+                            conflict = 'КОНФЛИКТ_ИНН'
+                        break
+                ranked.extend(da_ranked)
+                dadata_check = {'group_id': group['group_id'], 'registry_inn': '',
+                                'dadata_inn': proposed['candidate_inn'] if proposed else '',
+                                'status': conflict or 'ТРЕБУЕТ_ПРОВЕРКИ'}
+            if check_cancel:
+                check_cancel()
+
+        if selected and api is None:
+            unverified, selected = selected, None
+        if license_truncated or truncated:
+            selected = unverified = None
+
         unique = {}
         for c in ranked:
             key = (c['source'], c['candidate_inn'], c['candidate_name'], c['address'], c['legal_status'])
             unique[key] = c
         candidates.extend({**c, 'group_id': group['group_id']} for c in unique.values())
 
-        if selected:
+        if conflict:
+            status = conflict
+        elif unverified:
+            status = 'ЮРИДИЧЕСКИЙ_СТАТУС_НЕ_ПОДТВЕРЖДЁН'
+        elif selected:
             status = 'СОПОСТАВЛЕНО'
         elif any('ОБРЕЗАННОЕ_НАЗВАНИЕ' in c['reasons'] for c in ranked) or 'ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ' in record.get('flags', []):
             status = 'ПРОВЕРИТЬ_ОБРЕЗКА'
@@ -549,8 +643,14 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
         else:
             status = 'НЕ_СОПОСТАВЛЕНО'
 
+        final_status = 'ВРУЧНАЯ' if conflict or license_truncated or truncated else acceptance_status(selected, ranked, record, cfg)
+        if unverified:
+            final_status = 'ПРОВЕРИТЬ'
+        review_candidate = (unverified or max(ranked, key=lambda c: c['score'])) if final_status == 'ПРОВЕРИТЬ' else None
         resolutions.append({'group_id': group['group_id'], 'record_ids': group['record_ids'],
-            'source_name': record['name'], 'selected': selected, 'status': status,
+            'source_name': record['name'], 'selected': selected, 'status': final_status, 'review_candidate': review_candidate,
+            'dadata_check': dadata_check,
+            'decision_reason': status,
             'license_used': license_used, 'license_truncated': license_truncated,
             'registry_used': registry_used, 'registry_truncated': truncated,
             'candidate_count': len(unique)})
@@ -559,6 +659,8 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             print(f"{index}/{len(result['groups'])}: {status}; DaData={requests_count}", flush=True)
         if on_progress:
             on_progress(index, len(result['groups']))
+    result['dadata_checks'] = [g['dadata_check'] for g in resolutions if g['dadata_check']]
+    result['dadata_candidates'] = [c for c in candidates if c['source'] == 'DaData']
     result['resolution'] = {'groups': resolutions, 'candidates': candidates,
                             'requests': api.requests if api is not None else [],
                             'actual_requests': api.actual_requests if api is not None else 0,

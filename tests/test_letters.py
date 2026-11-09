@@ -108,7 +108,7 @@ class LetterTests(unittest.TestCase):
         letter, = result['letters_ready']
         self.assertEqual(letter['student_count'], 2)
         self.assertEqual(letter['letter_type'], 'Для нескольких поступивших')
-        self.assertEqual(letter['students'], 'Иванов Иван Иванович\nПетрова Анна Ивановна')
+        self.assertEqual(letter['students'], 'Иванов Иван Иванович, Петрова Анна Ивановна')
         self.assertIn('поступивших:\nИванов Иван Иванович\nПетрова Анна Ивановна.',
                       letter['letter_fragment'])
 
