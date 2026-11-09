@@ -1,22 +1,21 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let files = [], config = null, busy = false, currentJob = null, timer = null, registryTimer = null, licensesTimer = null;
+const sheets = new Map();
 function showError(message) { $('error').textContent = message; $('error').hidden = !message; }
 function setBusy(value) { busy = value; $('controls').disabled = value; updateButton(); }
 function updateButton() {
-  $('start').disabled = busy || !files.length;
+  $('start').disabled = busy || !files.length || !config;
+  $('check-dadata').disabled = busy || !files.length || !config;
   $('start').firstChild.textContent = !files.length ? 'Сначала загрузите Excel ' : 'Обработать таблицы ';
 }
 function updateConnection() {
-  $('connection').textContent = $('offline').checked ? 'Без новых запросов DaData'
-    : $('token').value.trim() ? 'Ключ введён — проверим при обработке'
+  $('connection').textContent = $('token').value.trim() ? 'Ключ для отдельной сверки введён'
     : config?.token_saved ? 'Ключ сохранён в системе'
-    : config?.token_configured ? 'Ключ задан на сервере'
-    : 'Без ключа: обработка по реестру Рособрнадзора';
+    : config?.token_configured ? 'Ключ для сверки задан на сервере' : 'Для обычной обработки ключ не нужен';
 }
 $('token').addEventListener('input', updateConnection);
-$('offline').addEventListener('change', updateConnection);
-function addFiles(incoming) {
+async function addFiles(incoming) {
   if (busy) return;
   showError('');
   const next = [...files];
@@ -26,6 +25,20 @@ function addFiles(incoming) {
   }
   if (next.length > 10 || next.reduce((n, file) => n + file.size, 0) > 100 * 1024 * 1024) return showError('Можно загрузить до 10 файлов общим размером не больше 100 МБ.');
   files = next; renderFiles();
+  if (!config) return;
+  setBusy(true);
+  try {
+    const pending = files.filter(file => !sheets.has(file));
+    if (pending.length) {
+      const info = await request('/api/sheets', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf}, body:JSON.stringify({files:await Promise.all(pending.map(encodeFile))})});
+      for (const [index, file] of pending.entries()) {
+        const entry = info[index];
+        if (entry) sheets.set(file, {...entry, selected:''});
+      }
+    }
+    renderFiles();
+  } catch (error) { showError(error.message); }
+  finally { setBusy(false); }
 }
 function renderFiles() {
   $('file-list').replaceChildren();
@@ -33,8 +46,19 @@ function renderFiles() {
     const li = document.createElement('li'), name = document.createElement('span'), size = document.createElement('small'), remove = document.createElement('button');
     name.textContent = file.name; size.textContent = Math.max(1, Math.round(file.size / 1024)) + ' КБ';
     remove.type = 'button'; remove.className = 'remove'; remove.textContent = '×'; remove.setAttribute('aria-label', 'Убрать ' + file.name);
-    remove.onclick = () => { files.splice(index, 1); renderFiles(); };
-    li.append(name, size, remove); $('file-list').append(li);
+    remove.onclick = () => { sheets.delete(file); files.splice(index, 1); renderFiles(); };
+    li.append(name, size, remove);
+    const info = sheets.get(file);
+    if (info) {
+      const label = document.createElement('label'), select = document.createElement('select');
+      label.textContent = 'Рабочий лист'; select.setAttribute('aria-label', 'Рабочий лист: ' + file.name);
+      for (const title of ['', ...info.sheets]) {
+        const option = document.createElement('option'); option.value = title; option.textContent = title || 'Определить автоматически'; select.append(option);
+      }
+      select.value = info.selected; select.onchange = () => { info.selected = select.value; };
+      label.append(select); li.append(label);
+    }
+    $('file-list').append(li);
   });
   updateButton();
 }
@@ -59,15 +83,21 @@ function encodeFile(file) {
 }
 $('form').onsubmit = async e => {
   e.preventDefault();
-  if (busy || !files.length) return;
-  // Ключ DaData не обязателен: без него обработка идёт по реестру Рособрнадзора.
+  if (busy || !files.length || !config) return;
+  const checking = e.submitter?.id === 'check-dadata';
+  if (checking && !config.token_configured && !$('token').value.trim()) {
+    $('settings').open = true; $('token').focus(); return showError('Введите API-ключ DaData в настройках подключения.');
+  }
   showError(''); setBusy(true); currentJob = null; $('cancel').hidden = true;
   $('result').hidden = true; $('progress-card').hidden = false;
   $('phase').textContent = 'Загружаем файлы'; $('progress').value = 0; $('percentage').textContent = '0%'; $('progress-note').textContent = 'Подготавливаем таблицы…';
   try {
     const encoded = await Promise.all(files.map(encodeFile));
-    const job = await request('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf}, body:JSON.stringify({files:encoded, token:$('token').value, offline:$('offline').checked, save_token:$('save-token').checked})});
-    if ($('token').value.trim()) { config.token_configured = true; config.token_saved ||= $('save-token').checked; }
+    const selected = files.map(file => sheets.get(file)?.selected || '');
+    const payload = {files:encoded, sheets:selected, mode:checking ? 'dadata_check' : 'registry'};
+    if (checking) Object.assign(payload, {token:$('token').value, save_token:$('save-token').checked});
+    const job = await request('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf}, body:JSON.stringify(payload)});
+    if (checking && $('token').value.trim()) { config.token_configured = true; config.token_saved ||= $('save-token').checked; }
     $('token').value = ''; updateConnection(); updateTokenNote(); currentJob = job.id; sessionStorage.setItem('schools-job', currentJob); poll();
   } catch (error) { showError(error.message); $('progress-card').hidden = true; $('cancel').hidden = true; setBusy(false); }
 };
@@ -86,7 +116,7 @@ async function poll() {
     const job = await request('/api/jobs/' + currentJob);
     showError(''); $('progress-card').hidden = false;
     $('phase').textContent = job.phase; $('progress').value = job.progress; $('percentage').textContent = job.progress + '%';
-    $('progress-note').textContent = job.total ? `Проверено групп учреждений: ${job.done} из ${job.total}` : 'Подготавливаем данные…';
+    $('progress-note').textContent = job.total ? `Шагов поиска и сверки: ${job.done} из ${job.total}` : 'Подготавливаем данные…';
     if (job.status === 'running' || job.status === 'cancelling') {
       setBusy(true); $('cancel').hidden = false; $('cancel').disabled = job.status === 'cancelling';
       $('cancel').textContent = job.status === 'cancelling' ? 'Отменяем…' : 'Отменить обработку';
@@ -164,6 +194,7 @@ $('forget-token').onclick = async () => {
 };
 function renderResult(job) {
   $('result').hidden = false; $('download').href = job.download;
+  $('journal').href = job.journal; $('journal').hidden = !job.journal;
   $('result-title').textContent = job.partial ? 'Таблица готова, есть ошибки поиска' : 'Таблица готова';
   $('metrics').replaceChildren();
   for (const [value, label] of [[job.summary.rows,'строк обработано'],[job.summary.schools,'учреждений объединено'],[job.summary.students,'пар ФИО и номер дела'],[job.summary.review,'строк требуют проверки']]) {
@@ -187,8 +218,8 @@ async function init() {
   try {
     config = await request('/api/config');
     updateConnection();
-    if (!config.token_configured) $('settings').open = true;
     updateTokenNote(); renderRegistry(); renderLicenses();
+    if (files.length) await addFiles([]);
     updateButton();
     currentJob = sessionStorage.getItem('schools-job');
     if (currentJob) { const previous = await request('/api/jobs/' + currentJob).catch(() => null); if (previous) { setBusy(['running','cancelling'].includes(previous.status)); poll(); } else sessionStorage.removeItem('schools-job'); }

@@ -49,8 +49,15 @@ class UploadTests(unittest.TestCase):
                 }), encoding='utf-8')
                 app = Application(root / 'runs', root / 'registry', root / 'cache.json')
                 app.jobs['configured'] = {'status': 'running'}
-                with patch('ou_processor.web.ROOT', root):
-                    app.run('configured', unpack_uploads([school_upload()]), '', True)
+                class Registry:
+                    metadata = {}
+                    connection = type('Connection', (), {'close': lambda self: None})()
+                    def __init__(self, *args, **kwargs):
+                        pass
+                    def search(self, record):
+                        return [{**cached, 'source': 'Реестр аккредитации'}], False
+                with patch('ou_processor.web.ROOT', root), patch('ou_processor.workflow.RegistrySearch', Registry):
+                    app.run('configured', unpack_uploads([school_upload()]))
                 job = app.snapshot('configured')
                 self.assertEqual(job['status'], 'done', job.get('error'))
                 self.assertEqual(job['summary']['schools'], school_count)
@@ -63,7 +70,7 @@ class UploadTests(unittest.TestCase):
             def __init__(self, token):
                 self.token = token
             def suggest(self, query):
-                return []
+                raise AssertionError('Обычная обработка не вызывает DaData')
         with tempfile.TemporaryDirectory() as root:
             app = Application(Path(root)/'runs', Path(root)/'registry', Path(root)/'cache.json',
                               token='test-key', client_factory=EmptyClient)
@@ -75,7 +82,7 @@ class UploadTests(unittest.TestCase):
             job = app.snapshot(job_id)
             self.assertEqual(job['status'], 'done', job.get('error'))
             self.assertEqual(job['summary']['review'], 1)
-            self.assertTrue(any('Резервный реестр недоступен' in warning for warning in job['warnings']))
+            self.assertTrue(any('Локальный реестр недоступен' in warning for warning in job['warnings']))
             book = load_workbook(Path(root)/'runs'/job_id/'result'/'schools.xlsx', read_only=True)
             self.assertEqual(book['Проверить']['E2'].value, 'Иванов Иван')
             self.assertEqual(book['Проверить']['F2'].value, '0001')
@@ -91,7 +98,7 @@ class UploadTests(unittest.TestCase):
             store = Store()
             app = Application(root, root, Path(root)/'cache.json', token_store=store)
             with patch.object(app, 'run'):
-                app.start({'files':[upload()], 'token':'private-test-key', 'save_token':True})
+                app.start({'files':[upload()], 'mode':'dadata_check', 'token':'private-test-key', 'save_token':True})
             self.assertEqual(store.value, 'private-test-key')
             self.assertNotIn('private-test-key', json.dumps(app.settings()))
             reopened = Application(root, root, Path(root)/'cache.json', token_store=store)
@@ -113,19 +120,11 @@ class UploadTests(unittest.TestCase):
     def test_filename_cannot_escape_upload_directory(self):
         self.assertEqual(unpack_uploads([upload('../../test.xlsx')])[0][0],'test.xlsx')
 
-    def test_without_key_processing_runs_by_registry(self):
-        # Ключ DaData не обязателен: обычная обработка идёт по реестру без обращений к DaData.
+    def test_missing_key_for_explicit_check_is_reported(self):
         with tempfile.TemporaryDirectory() as root:
-            app = Application(Path(root)/'runs', Path(root)/'registry', Path(root)/'cache.json')
-            job_id = app.start({'files':[school_upload()]})
-            self.assertIsInstance(job_id, str)
-            for _ in range(500):
-                if app.snapshot(job_id)['status'] != 'running':
-                    break
-                time.sleep(.01)
-            job = app.snapshot(job_id)
-            self.assertEqual(job['status'], 'done', job.get('error'))
-            self.assertTrue(any('DaData' in w and 'реестр' in w.lower() for w in job['warnings']))
+            app=Application(root,root,Path(root)/'cache.json')
+            with self.assertRaisesRegex(UserError,'API-ключ'):
+                app.start({'files':[upload()], 'mode':'dadata_check'})
 
     def test_job_failure_releases_worker(self):
         with tempfile.TemporaryDirectory() as root:
@@ -147,7 +146,7 @@ class UploadTests(unittest.TestCase):
 
     def test_cancel_stops_worker_and_removes_uploaded_file(self):
         entered, release = threading.Event(), threading.Event()
-        def paused_read(paths, should_cancel):
+        def paused_read(paths, should_cancel, sheet_names):
             entered.set()
             release.wait(5)
             should_cancel()
@@ -204,6 +203,29 @@ class HTTPTests(unittest.TestCase):
     def test_post_requires_csrf(self):
         status,_=self.call('/api/jobs','POST','{}')
         self.assertEqual(status,403)
+
+    def test_sheet_inspection_requires_csrf_and_returns_workbook_sheets(self):
+        body = json.dumps({'files': [school_upload()]})
+        self.assertEqual(self.call('/api/sheets', 'POST', body)[0], 403)
+        status, data = self.call('/api/sheets', 'POST', body, {'X-CSRF-Token': self.server.app.csrf})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data)[0]['sheets'], ['Sheet'])
+
+    def test_journal_download_requires_finished_job(self):
+        job_id = 'b' * 32
+        app = self.server.app
+        app.jobs[job_id] = {'id': job_id, 'status': 'running'}
+        try:
+            self.assertEqual(self.call(f'/api/jobs/{job_id}/journal')[0], 409)
+            folder = Path(self.temp.name) / job_id / 'result'
+            folder.mkdir(parents=True)
+            (folder / 'processing_log.json').write_text('{"mode":"registry"}')
+            app.jobs[job_id]['status'] = 'done'
+            status, data = self.call(f'/api/jobs/{job_id}/journal')
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(data)['mode'], 'registry')
+        finally:
+            app.jobs.pop(job_id, None)
 
     def test_cross_origin_is_rejected(self):
         status,_=self.call('/api/jobs','POST','{}',{'Origin':'https://other.example','X-CSRF-Token':self.server.app.csrf})

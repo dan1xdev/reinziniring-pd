@@ -13,7 +13,6 @@ from pathlib import Path
 import re
 import secrets
 import shutil
-import sqlite3
 import threading
 import webbrowser
 import zipfile
@@ -21,13 +20,13 @@ import zipfile
 from .dadata import DaDataClient
 from .key_storage import TokenStore
 from .full_run import aggregate, save
-from .input import read_records
+from .input import list_sheets, read_records
 from .license_registry import auto_update as license_auto_update
 from .license_registry import current_snapshot as current_license_snapshot
 from .pipeline import process
 from .registry import current_snapshot
-from .resolution import LicenseSearch, RegistrySearch, SearchCache, resolve
 from .registry_worker import RegistryWorker
+from .workflow import search
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_BYTES = 100 * 1024 * 1024
@@ -43,7 +42,7 @@ class JobCancelled(Exception):
     pass
 
 
-def unpack_uploads(files):
+def unpack_uploads(files, deduplicate=True):
     if not isinstance(files, list) or not 1 <= len(files) <= 10:
         raise UserError('Выберите от 1 до 10 файлов Excel (.xlsx).')
     result, seen, total = [], set(), 0
@@ -69,7 +68,7 @@ def unpack_uploads(files):
         except (zipfile.BadZipFile, ValueError):
             raise UserError(f'«{name}» не является корректной книгой .xlsx или защищена паролем.') from None
         digest = hashlib.sha256(content).hexdigest()
-        if digest not in seen:
+        if not deduplicate or digest not in seen:
             result.append((name, content))
             seen.add(digest)
     return result
@@ -94,8 +93,6 @@ class Application:
                 # Недоступное системное хранилище не мешает обработке с введённым ключом.
                 pass
         self.registry_worker = registry_worker or RegistryWorker(self.registry)
-        # Реестр лицензий обновляется в фоне по настройкам config.json
-        # (раздел license_registry, поле update_days).
         self.licenses_worker = licenses_worker or RegistryWorker(self.licenses, updater=license_auto_update)
         self.csrf = secrets.token_urlsafe(32)
         self.jobs = {}
@@ -135,23 +132,47 @@ class Application:
         self.token = self.initial_token
         self.token_saved = False
 
+    def inspect(self, payload):
+        if not isinstance(payload, dict):
+            raise UserError('Некорректные параметры загрузки.')
+        result = []
+        for name, content in unpack_uploads(payload.get('files'), deduplicate=False):
+            try:
+                sheets = list_sheets(io.BytesIO(content))
+            except Exception:
+                raise UserError(f'Не удалось прочитать листы «{name}». Проверьте, что книга открывается в Excel.') from None
+            result.append({'name': name, 'sha256': hashlib.sha256(content).hexdigest(), 'sheets': sheets})
+        return result
+
     def start(self, payload):
         if not isinstance(payload, dict):
             raise UserError('Некорректные параметры загрузки.')
-        uploaded = unpack_uploads(payload.get('files'))
-        token = payload.get('token') or self.token
+        supplied = unpack_uploads(payload.get('files'), deduplicate=False)
+        mode = payload.get('mode', 'registry')
+        if not isinstance(mode, str) or mode not in {'registry', 'dadata_check'}:
+            raise UserError('Выберите обработку по реестру или отдельную сверку DaData.')
+        sheets = payload.get('sheets', [''] * len(supplied))
+        if (not isinstance(sheets, list) or len(sheets) != len(supplied)
+                or any(not isinstance(value, str) or len(value) > 31 for value in sheets)):
+            raise UserError('Не удалось прочитать выбор листов. Выберите файлы повторно.')
+        uploaded, selected_sheets, seen = [], [], set()
+        for (name, content), sheet in zip(supplied, sheets):
+            key = (hashlib.sha256(content).digest(), sheet)
+            if key in seen:
+                continue
+            seen.add(key)
+            uploaded.append((name, content))
+            selected_sheets.append(sheet)
+        token = (payload.get('token') or self.token) if mode == 'dadata_check' else ''
         if not isinstance(token, str) or len(token) > 256 or '\n' in token or '\r' in token:
             raise UserError('Проверьте API-ключ DaData.')
         token = token.strip()
-        offline = payload.get('offline') is True
-        if not token and not offline:
-            # Обычная обработка без ключа DaData: работает по реестру
-            # Рособрнадзора, без обращений к DaData.
-            offline = True
+        if mode == 'dadata_check' and not token:
+            raise UserError('Для отдельной сверки введите API-ключ DaData. Обычная обработка по реестру работает без ключа.')
         with self.lock:
             if self.active:
                 raise UserError('Уже идёт обработка. Дождитесь её завершения.')
-            if payload.get('save_token') is True and payload.get('token'):
+            if mode == 'dadata_check' and payload.get('save_token') is True and payload.get('token'):
                 if not self.token_store:
                     raise UserError('Системное хранилище ключей недоступно. Снимите флажок сохранения ключа.')
                 try:
@@ -159,13 +180,14 @@ class Application:
                 except Exception:
                     raise UserError('Не удалось сохранить ключ. Проверьте доступ к системному хранилищу или снимите флажок сохранения.') from None
                 self.token_saved = True
-            self.token = token
+            if mode == 'dadata_check':
+                self.token = token
             job_id = secrets.token_hex(16)
             self.jobs[job_id] = {'id': job_id, 'status': 'running', 'phase': 'Читаем Excel',
                                  'progress': 2, 'done': 0, 'total': 0, 'error': ''}
             self.cancel_flags[job_id] = threading.Event()
             self.active = job_id
-        thread = threading.Thread(target=self.run, args=(job_id, uploaded, token, offline), daemon=True)
+        thread = threading.Thread(target=self.run, args=(job_id, uploaded, token, mode, selected_sheets), daemon=True)
         thread.start()
         return job_id
 
@@ -208,15 +230,13 @@ class Application:
                 raise JobCancelled()
             self.jobs[job_id].update(status='done', phase='Готово', progress=100, **fields)
 
-    def run(self, job_id, uploaded, token, offline):
-        reserve = None
-        licenses_search = None
+    def run(self, job_id, uploaded, token='', mode='registry', sheets=None):
         was_cancelled = False
         directory = self.storage / job_id
         try:
             self.check_cancel(job_id)
             directory.mkdir(parents=True, mode=0o700)
-            paths = []
+            paths, sheet_names = [], {}
             for index, (name, content) in enumerate(uploaded):
                 self.check_cancel(job_id)
                 folder = directory / 'inputs' / str(index)
@@ -224,25 +244,20 @@ class Application:
                 path = folder / name
                 path.write_bytes(content)
                 paths.append(path)
+                sheet_names[str(path.resolve())] = sheets[index] if sheets else ''
             config = json.loads((ROOT / 'config.json').read_text())
-            records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id))
+            records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id), sheet_names=sheet_names)
             self.check_cancel(job_id)
             if len(records) > 5000:
                 raise UserError('В прототипе можно обработать до 5 000 строк за запуск. Разделите таблицу.')
             result = process(records, config)
             self.check_cancel(job_id)
             result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
-            self.change(job_id, phase='Ищем организации и адреса', progress=8, total=len(result['groups']))
-            api = SearchCache(self.cache, None if offline else self.client_factory(token))
-            try:
-                licenses_search = LicenseSearch(self.licenses, config=config)
-            except (ValueError, OSError, KeyError, sqlite3.Error):
-                licenses_search = None
-            try:
-                reserve = RegistrySearch(self.registry, config=config)
-            except (ValueError, OSError, KeyError, sqlite3.Error):
-                reserve = None
-            resolve(result, api, reserve, progress=False, config=config, licenses=licenses_search,
+            phase = 'Ищем в реестрах и отдельно сверяем DaData' if mode == 'dadata_check' else 'Ищем организации в локальных реестрах'
+            self.change(job_id, phase=phase, progress=8, total=len(result['groups']))
+            client = self.client_factory(token) if mode == 'dadata_check' else None
+            search(result, self.registry, config, licenses_path=self.licenses,
+                cache=self.cache, client=client,
                 on_progress=lambda done, total: self.progress(job_id, done, total),
                 check_cancel=lambda: self.check_cancel(job_id))
             self.check_cancel(job_id)
@@ -254,17 +269,7 @@ class Application:
             summary = result['full_summary']
             errors = [r['status'] for r in result['resolution']['requests'] if r['status'] != 'OK']
             issues = summary['Исходных строк на проверку'] + result['summary']['selection_review_rows']
-            warnings = []
-            if errors:
-                warnings.append('Не все запросы DaData выполнены. Проверьте лист «Запросы DaData»: ' + ', '.join(sorted(set(errors))))
-            if offline:
-                warnings.append('Использованы только сохранённые ответы DaData. Новых запросов не было.')
-            if offline and not token:
-                warnings.append('Ключ DaData не указан: обработка выполнена по реестру Рособрнадзора, без обращений к DaData.')
-            if licenses_search is None:
-                warnings.append('Реестр лицензий недоступен. Запустите: python -m ou_processor.license_registry update. Ненайденные учреждения сохранены на листе «Проверить».')
-            if reserve is None:
-                warnings.append('Резервный реестр недоступен. Ненайденные учреждения сохранены на листе «Проверить».')
+            warnings = list(result['warnings'])
             missing = summary['Строк без данных ученика']
             if missing:
                 warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
@@ -274,7 +279,7 @@ class Application:
                          'addresses': summary['Учреждений с адресом'],
                          'excluded': result['summary']['excluded_rows']},
                 warnings=warnings, partial=bool(errors), preview=result['schools'][:20],
-                download=f'/api/jobs/{job_id}/download')
+                download=f'/api/jobs/{job_id}/download', journal=f'/api/jobs/{job_id}/journal')
         except JobCancelled:
             was_cancelled = True
         except (UserError, ValueError) as error:
@@ -290,10 +295,6 @@ class Application:
                 self.change(job_id, status='error', phase='Обработка не завершена',
                             error='Не удалось обработать файл. Проверьте формат книги и доступность папки результатов.')
         finally:
-            if licenses_search:
-                licenses_search.connection.close()
-            if reserve:
-                reserve.connection.close()
             if was_cancelled:
                 shutil.rmtree(directory, ignore_errors=True)
             with self.lock:
@@ -326,7 +327,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
         if attachment:
-            self.send_header('Content-Disposition', 'attachment; filename="schools.xlsx"')
+            filename = attachment if isinstance(attachment, str) else 'schools.xlsx'
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(data)
 
@@ -341,7 +343,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, (ROOT / 'ou_processor' / 'static' / name).read_bytes(), content_type)
         if self.path == '/api/config':
             return self.send(200, self.app.settings())
-        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download)?', self.path)
+        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download|/journal)?', self.path)
         if match:
             job = self.app.snapshot(match[1])
             if job:
@@ -349,6 +351,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(200, job)
                 if job['status'] != 'done':
                     return self.send(409, {'error': 'Результат ещё не готов.'})
+                if match[2] == '/journal':
+                    path = self.app.storage / match[1] / 'result' / 'processing_log.json'
+                    return self.send(200, path.read_bytes(), 'application/octet-stream', attachment='processing_log.json')
                 path = self.app.storage / match[1] / 'result' / 'schools.xlsx'
                 return self.send(200, path.read_bytes(),
                     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', attachment=True)
@@ -375,7 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {'token_configured': False, 'token_saved': False})
             except UserError as error:
                 return self.send(400, {'error': str(error)})
-        if self.path != '/api/jobs':
+        if self.path not in {'/api/jobs', '/api/sheets'}:
             return self.send(404, {'error': 'Не найдено.'})
         try:
             size = int(self.headers.get('Content-Length', '0'))
@@ -383,6 +388,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise UserError('Суммарный размер файлов не должен превышать 100 МБ.')
             self.connection.settimeout(60)
             payload = json.loads(self.rfile.read(size))
+            if self.path == '/api/sheets':
+                return self.send(200, self.app.inspect(payload))
             job_id = self.app.start(payload)
             self.send(202, {'id': job_id})
         except (UserError, ValueError, UnicodeError) as error:
@@ -405,7 +412,8 @@ def main():
         if existing.exists():
             args.cache.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(existing, args.cache)
-    app = Application(args.storage, args.registry, args.cache, token, token_store=TokenStore(), licenses=args.licenses)
+    app = Application(args.storage, args.registry, args.cache, token,
+                      token_store=TokenStore(), licenses=args.licenses)
     try:
         server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     except OSError:

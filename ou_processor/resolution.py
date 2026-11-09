@@ -1,5 +1,4 @@
-"""Полный поиск: реестр лицензий (основной), затем DaData и резервный реестр;
-объединение только по ИНН."""
+"""Поиск по реестру лицензий и резервному реестру; DaData — отдельная сверка."""
 
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -406,21 +405,21 @@ class LicenseSearch:
         found = self.cache[key]
         result = []
         seen = set()
-        for r in found[:2000]:
-            duplicate = (r['inn'], r['full_name'], r['license_number'], r['status'])
+        for row in found[:2000]:
+            duplicate = (row['inn'], row['full_name'], row['license_number'], row['status'])
             if duplicate in seen:
                 continue
             seen.add(duplicate)
-            active = (r['status'] or '').strip().casefold() in {
+            active = (row['status'] or '').strip().casefold() in {
                 'действующая', 'действует', 'действующее'
             }
-            result.append({'candidate_inn': r['inn'], 'candidate_ogrn': r['ogrn'],
-                'candidate_name': r['full_name'], 'short_name': r['short_name'],
-                'address': r['address'] or '', 'region': r['region'] or '', 'city': '',
-                'postal_code': (re.search(r'\b\d{6}\b', r['address'] or '') or [''])[0],
-                'legal_status': 'Действующее' if active else (r['status'] or 'статус неизвестен'),
+            result.append({'candidate_inn': row['inn'], 'candidate_ogrn': row['ogrn'],
+                'candidate_name': row['full_name'], 'short_name': row['short_name'],
+                'address': row['address'] or '', 'region': row['region'] or '', 'city': '',
+                'postal_code': (re.search(r'\b\d{6}\b', row['address'] or '') or [''])[0],
+                'legal_status': 'Действующее' if active else (row['status'] or 'статус неизвестен'),
                 'branch_type': '', 'source': 'Реестр лицензий', 'source_url': LICENSE_SOURCE_PAGE,
-                'certificate_id': r['license_number'], 'issue_date': r['date_start']})
+                'certificate_id': row['license_number'], 'issue_date': row['date_start']})
         return result, len(found) > 2000
 
 
@@ -485,12 +484,9 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             check_cancel()
         record = by_id[group['record_ids'][0]]
         found = []
-        selected = None
-        ranked = []
+        selected, ranked = None, []
         license_used, license_truncated = False, False
         license_inns = set()
-        # 1. Реестр лицензий Рособрнадзора - основной источник по умолчанию.
-        #    Если совпадение найдено, DaData не вызывается.
         if licenses is not None:
             if check_cancel:
                 check_cancel()
@@ -502,7 +498,6 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             license_inns = {c['candidate_inn'] for c in license_ranked if c['candidate_inn'] and
                             (c['eligible'] or 'НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ' in c['reasons'])}
             ranked.extend(license_ranked)
-        # 2. DaData - вспомогательный источник: работает только если передан ключ.
         if not selected and api is not None:
             da_ranked = []
             for query in queries(record, cfg):
