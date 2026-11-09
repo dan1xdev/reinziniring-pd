@@ -134,7 +134,16 @@ def dedupe_personal_files(records, sources):
     return unique_records
 
 
-def read_records(paths, should_cancel=None, sheet_name=None):
+def list_sheets(path):
+    """Прочитать имена листов, не загружая строки книги."""
+    workbook = load_workbook(path, read_only=True, data_only=False)
+    try:
+        return workbook.sheetnames
+    finally:
+        workbook.close()
+
+
+def read_records(paths, should_cancel=None, sheet_name=None, sheet_names=None):
     records, sources = [], []
     seen_paths = set()
     
@@ -145,6 +154,7 @@ def read_records(paths, should_cancel=None, sheet_name=None):
         if path in seen_paths:
             continue
         seen_paths.add(path)
+        selected_sheet = (sheet_names or {}).get(str(path), sheet_name)
         
         if path.suffix.lower() != ".xlsx":
             raise ValueError(f"Поддерживается .xlsx: {path.name}")
@@ -160,8 +170,8 @@ def read_records(paths, should_cancel=None, sheet_name=None):
         
         try:
             for sheet in workbook:
-                if sheet_name:
-                    if sheet.title != sheet_name:
+                if selected_sheet:
+                    if sheet.title != selected_sheet:
                         skipped.append(sheet.title)
                         continue
                     requested_sheet_found = True
@@ -188,9 +198,9 @@ def read_records(paths, should_cancel=None, sheet_name=None):
         finally:
             workbook.close()
             
-        if sheet_name and not requested_sheet_found:
+        if selected_sheet and not requested_sheet_found:
             available = ", ".join(f"«{s}»" for s in workbook.sheetnames)
-            raise ValueError(f"{path.name}: лист «{sheet_name}» не найден. Доступные листы: {available}")
+            raise ValueError(f"{path.name}: лист «{selected_sheet}» не найден. Доступные листы: {available}")
 
         if not count:
             if diagnostics:
@@ -199,7 +209,8 @@ def read_records(paths, should_cancel=None, sheet_name=None):
             raise ValueError(f"{path.name}: заголовки найдены, но нет строк с данными")
             
         sources.append({"file": path.name, "source_id": source_id, "path": str(path), "sha256": digest,
-                        "rows": count, "skipped_sheets": skipped, "duplicates_removed": 0})
+                        "rows": count, "selected_sheet": selected_sheet or "Автоматически",
+                        "skipped_sheets": skipped, "duplicates_removed": 0})
 
     records = dedupe_personal_files(records, sources)
 

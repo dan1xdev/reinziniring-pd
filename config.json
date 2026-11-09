@@ -1,6 +1,13 @@
 {
   "rules_version": "task3-1.0",
   "rules_note": "Доработан поиск и сопоставление ОУ: настраиваемые словари, веса и пороги скоринга, отрыв кандидатов, строгие блокирующие статусы по ТЗ.",
+  "license_registry": {
+    "source_page": "https://islod.obrnadzor.gov.ru/opendata_licenses.html",
+    "source_url": "",
+    "source_file": "",
+    "update_days": 1,
+    "keep_snapshots": 2
+  },
   "allowed_education": [
     "Среднее общее",
     "Среднее профессиональное",
