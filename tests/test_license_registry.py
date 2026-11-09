@@ -6,9 +6,10 @@ from pathlib import Path
 import tempfile
 import unittest
 import zipfile
+from openpyxl import Workbook
 
 from ou_processor.license_registry import build_index, current_snapshot, lookup, update, auto_update
-from ou_processor.resolution import LicenseSearch
+from ou_processor.resolution import LicenseSearch, choose
 
 
 XML = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -91,6 +92,41 @@ class LicenseRegistryTests(unittest.TestCase):
             path.write_text(CSV, encoding="utf-8-sig")
             base = build_index(path, Path(tmp) / "index.sqlite")
             self.assertEqual(base["records"], 1)
+
+    def test_local_csv_and_xlsx_sources_update_the_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "official.csv"
+            csv_path.write_text(CSV, encoding="utf-8-sig")
+            xlsx_path = root / "official.xlsx"
+            book = Workbook()
+            book.active.append(["Наименование лицензиата", "ИНН", "Номер лицензии"])
+            book.active.append(["Тестовая школа № 1", "0000000001", "Л035-00001-77/00000001"])
+            book.save(xlsx_path)
+
+            for source in (csv_path, xlsx_path):
+                with self.subTest(source=source.suffix):
+                    cache = root / (source.stem + "-cache")
+                    report = update(cache, settings={"source_page": "", "source_file": str(source)})
+                    self.assertEqual(report["status"], "updated")
+                    self.assertEqual(lookup(cache, inn="0000000001")["matches"][0]["full_name"],
+                                     "Тестовая школа № 1")
+
+    def test_inactive_license_is_not_eligible_for_automatic_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            xml = XML.replace("<StatusName>Действующая</StatusName>",
+                              "<StatusName>Недействующая</StatusName>", 1)
+            update(cache, settings={"update_days": 0}, opener=Server(archive_bytes(xml)))
+            search = LicenseSearch(cache)
+            try:
+                record = dict(name="Тестовая школа № 1", city="Москва", region="Москва", flags=[])
+                candidates, _ = search.search(record)
+                self.assertEqual(candidates[0]["legal_status"], "Недействующая")
+                selected, _ = choose(record, candidates)
+                self.assertIsNone(selected)
+            finally:
+                search.connection.close()
 
     def test_corrupt_download_preserves_current_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
