@@ -133,15 +133,22 @@ class Application:
     def start(self, payload):
         if not isinstance(payload, dict):
             raise UserError('Некорректные параметры загрузки.')
-        uploaded = unpack_uploads(payload.get('files'))
+        supplied = unpack_uploads(payload.get('files'), deduplicate=False)
         mode = payload.get('mode', 'registry')
         if not isinstance(mode, str) or mode not in {'registry', 'dadata_check'}:
             raise UserError('Выберите обработку по реестру или отдельную сверку DaData.')
-        sheets = payload.get('sheets', {})
-        digests = {hashlib.sha256(content).hexdigest() for _, content in uploaded}
-        if (not isinstance(sheets, dict) or any(key not in digests or not isinstance(value, str)
-                or len(value) > 31 for key, value in sheets.items())):
+        sheets = payload.get('sheets', [''] * len(supplied))
+        if (not isinstance(sheets, list) or len(sheets) != len(supplied)
+                or any(not isinstance(value, str) or len(value) > 31 for value in sheets)):
             raise UserError('Не удалось прочитать выбор листов. Выберите файлы повторно.')
+        uploaded, selected_sheets, seen = [], [], set()
+        for (name, content), sheet in zip(supplied, sheets):
+            key = (hashlib.sha256(content).digest(), sheet)
+            if key in seen:
+                continue
+            seen.add(key)
+            uploaded.append((name, content))
+            selected_sheets.append(sheet)
         token = (payload.get('token') or self.token) if mode == 'dadata_check' else ''
         if not isinstance(token, str) or len(token) > 256 or '\n' in token or '\r' in token:
             raise UserError('Проверьте API-ключ DaData.')
@@ -166,7 +173,7 @@ class Application:
                                  'progress': 2, 'done': 0, 'total': 0, 'error': ''}
             self.cancel_flags[job_id] = threading.Event()
             self.active = job_id
-        thread = threading.Thread(target=self.run, args=(job_id, uploaded, token, mode, sheets), daemon=True)
+        thread = threading.Thread(target=self.run, args=(job_id, uploaded, token, mode, selected_sheets), daemon=True)
         thread.start()
         return job_id
 
@@ -223,7 +230,7 @@ class Application:
                 path = folder / name
                 path.write_bytes(content)
                 paths.append(path)
-                sheet_names[str(path.resolve())] = (sheets or {}).get(hashlib.sha256(content).hexdigest(), '')
+                sheet_names[str(path.resolve())] = sheets[index] if sheets else ''
             config = json.loads((ROOT / 'config.json').read_text())
             records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id), sheet_names=sheet_names)
             self.check_cancel(job_id)

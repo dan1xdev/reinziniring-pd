@@ -93,7 +93,7 @@ $('form').onsubmit = async e => {
   $('phase').textContent = 'Загружаем файлы'; $('progress').value = 0; $('percentage').textContent = '0%'; $('progress-note').textContent = 'Подготавливаем таблицы…';
   try {
     const encoded = await Promise.all(files.map(encodeFile));
-    const selected = Object.fromEntries(files.filter(file => sheets.has(file)).map(file => [sheets.get(file).sha256, sheets.get(file).selected]));
+    const selected = files.map(file => sheets.get(file)?.selected || '');
     const payload = {files:encoded, sheets:selected, mode:checking ? 'dadata_check' : 'registry'};
     if (checking) Object.assign(payload, {token:$('token').value, save_token:$('save-token').checked});
     const job = await request('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf}, body:JSON.stringify(payload)});

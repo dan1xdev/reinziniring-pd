@@ -136,7 +136,7 @@ class WorkflowTests(unittest.TestCase):
                               client_factory=lambda _: self.fail('DaData client created'))
             data = upload()
             info = app.inspect({'files': [data]})[0]
-            job_id = app.start({'files': [data], 'sheets': {info['sha256']: 'Рабочий'}})
+            job_id = app.start({'files': [data], 'sheets': ['Рабочий']})
             job = wait_job(app, job_id)
             self.assertEqual(job['status'], 'done', job.get('error'))
             log = json.loads((root / 'runs' / job_id / 'result' / 'processing_log.json').read_text())
@@ -168,10 +168,35 @@ class WorkflowTests(unittest.TestCase):
             records, _ = read_records(paths, sheet_names={str(paths[0]): 'Первый', str(paths[1]): 'Рабочий'})
         self.assertEqual({r['source_sheet'] for r in records}, {'Первый', 'Рабочий'})
 
+    def test_ui_keeps_identical_books_with_different_selected_sheets(self):
+        book = Workbook()
+        book.active.title = 'Первый'
+        for sheet, school, file_number in (
+                (book.active, 'Школа 1', '0001'),
+                (book.create_sheet('Второй'), 'Школа 2', '0002')):
+            sheet.append(['Образовательное учреждение', 'Вид образования', 'ФИО', 'Личное дело.Номер'])
+            sheet.append([school, 'Среднее общее', 'Ученик', file_number])
+        stream = BytesIO()
+        book.save(stream)
+        content = base64.b64encode(stream.getvalue()).decode()
+        files = [{'name': 'a.xlsx', 'data': content}, {'name': 'b.xlsx', 'data': content}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = Application(root / 'runs', root / 'registry', root / 'cache.json')
+            job_id = app.start({'files': files, 'sheets': ['Первый', 'Второй']})
+            job = wait_job(app, job_id)
+            self.assertEqual(job['status'], 'done', job.get('error'))
+            result = json.loads((root / 'runs' / job_id / 'result' / 'result.json').read_text())
+
+        self.assertEqual([(source['file'], source['selected_sheet']) for source in result['sources']],
+                         [('a.xlsx', 'Первый'), ('b.xlsx', 'Второй')])
+        self.assertEqual({record['name'] for record in result['records']}, {'Школа 1', 'Школа 2'})
+
     def test_invalid_mode_and_sheet_selection_are_explained(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = Application(tmp, tmp, Path(tmp) / 'cache.json')
-            for extra in ({'mode': []}, {'sheets': {'unknown': 'Рабочий'}}):
+            for extra in ({'mode': []}, {'sheets': ['Рабочий', 'Лишний']}):
                 with self.assertRaises(UserError):
                     app.start({'files': [upload()], **extra})
 
