@@ -34,6 +34,11 @@ from .normalization import normalize
 
 SOURCE_PAGE = "https://islod.obrnadzor.gov.ru/opendata_licenses.html"
 DATA_LINK_RE = re.compile(r"[^\s\"'<>]*data-(\d{8})-structure-\d{8}\.zip")
+DYNAMIC_LINK_RE = re.compile(
+    r"e\.href\s*=\s*['\"](?P<prefix>/[^'\"]*data-)['\"]\s*\+\s*"
+    r"formatDate\(\s*yesterday\s*\)\s*\+\s*"
+    r"['\"](?P<suffix>-structure-\d{8}\.zip)['\"]"
+)
 DEFAULT_CACHE = Path(__file__).resolve().parents[2] / "license_registry_cache"
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.json"
 MAX_ARCHIVE_BYTES = 2 * 1024 ** 3
@@ -271,8 +276,9 @@ def load_settings(config_path=DEFAULT_CONFIG):
 def resolve_data_url(settings, opener=urlopen):
     """Определяет ссылку на актуальную официальную выгрузку.
 
-    Сначала берётся прямая ссылка из настроек, затем страница открытых данных,
-    с которой снимается самый свежий файл data-ДДДДММГГ-structure-*.zip."""
+    Сначала берётся прямая ссылка из настроек, затем страница открытых данных.
+    На странице адрес файла может создаваться JavaScript, а текст ссылки
+    оставаться старым; в этом случае проверяется последний доступный архив."""
     direct = str(settings.get("source_url", "") or "").strip()
     if direct:
         return direct
@@ -285,6 +291,22 @@ def resolve_data_url(settings, opener=urlopen):
                                      "Accept-Encoding": "identity"})
     with opener(request, timeout=60) as response:
         html = response.read(5 * 1024 * 1024).decode("utf-8", "replace")
+    dynamic = DYNAMIC_LINK_RE.search(html)
+    if dynamic:
+        for days_ago in range(7):
+            day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y%m%d")
+            url = urljoin(page, dynamic.group("prefix") + day + dynamic.group("suffix"))
+            try:
+                with opener(Request(url, method="HEAD", headers={"User-Agent": "OURegistryPrototype/0.1"}),
+                            timeout=60):
+                    return url
+            except HTTPError as error:
+                if error.code == 404:
+                    continue
+                if error.code in {405, 501}:
+                    return url
+                raise
+        raise ValueError("Официальная выгрузка реестра за последние 7 дней недоступна")
     candidates = [(match.group(1), match.group(0)) for match in DATA_LINK_RE.finditer(html)]
     if not candidates:
         raise ValueError("На странице открытых данных не найдена ссылка на файл выгрузки")

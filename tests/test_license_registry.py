@@ -1,14 +1,16 @@
 """Проверки реестра лицензий: обновление, снимок при сбое, поиск, настройки."""
 
 from io import BytesIO
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 import zipfile
 from openpyxl import Workbook
 
-from ou_processor.license_registry import build_index, current_snapshot, lookup, update, auto_update
+from ou_processor.license_registry import build_index, current_snapshot, lookup, update, auto_update, resolve_data_url
 from ou_processor.resolution import LicenseSearch, choose
 
 
@@ -67,6 +69,58 @@ class Server:
 
 
 class LicenseRegistryTests(unittest.TestCase):
+    def test_dynamic_official_link_replaces_stale_archive_text(self):
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d")
+        expected = ("https://islod.obrnadzor.gov.ru/opendata-lic/"
+                    f"data-{yesterday}-structure-20150421.zip")
+        page = b'''<a href="/rlic/opendata/" id="hlink">opendata/7701537808-FBDRL/data-20251219-structure-20150421.zip</a>
+<script>e.href = '/opendata-lic/data-'+formatDate(yesterday) + '-structure-20150421.zip';</script>'''
+        calls = []
+
+        def opener(request, timeout):
+            url = request.get_full_url()
+            calls.append(url)
+            if url.endswith("opendata_licenses.html"):
+                return Response(page, {})
+            if url == expected and request.get_method() == "HEAD":
+                return Response(b"", {"Content-Type": "application/zip"})
+            raise HTTPError(url, 404, "Not Found", {}, None)
+
+        self.assertEqual(resolve_data_url({}, opener), expected)
+        self.assertNotIn("data-20251219-structure-20150421.zip", calls)
+
+    def test_dynamic_link_uses_previous_published_day(self):
+        published = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y%m%d")
+        expected = ("https://islod.obrnadzor.gov.ru/opendata-lic/"
+                    f"data-{published}-structure-20150421.zip")
+        page = b'''<script>e.href = '/opendata-lic/data-'+formatDate(yesterday) + '-structure-20150421.zip';</script>'''
+
+        def opener(request, timeout):
+            url = request.get_full_url()
+            if url.endswith("opendata_licenses.html"):
+                return Response(page, {})
+            if url == expected and request.get_method() == "HEAD":
+                return Response(b"", {"Content-Type": "application/zip"})
+            raise HTTPError(url, 404, "Not Found", {}, None)
+
+        self.assertEqual(resolve_data_url({}, opener), expected)
+
+    def test_dynamic_link_uses_current_day_when_published(self):
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        expected = ("https://islod.obrnadzor.gov.ru/opendata-lic/"
+                    f"data-{today}-structure-20150421.zip")
+        page = b'''<script>e.href = '/opendata-lic/data-'+formatDate(yesterday) + '-structure-20150421.zip';</script>'''
+
+        def opener(request, timeout):
+            url = request.get_full_url()
+            if url.endswith("opendata_licenses.html"):
+                return Response(page, {})
+            if url == expected and request.get_method() == "HEAD":
+                return Response(b"", {"Content-Type": "application/zip"})
+            raise HTTPError(url, 404, "Not Found", {}, None)
+
+        self.assertEqual(resolve_data_url({}, opener), expected)
+
     def test_update_then_unchanged_and_lookup(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
