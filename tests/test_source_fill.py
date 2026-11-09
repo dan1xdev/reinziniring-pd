@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+from zipfile import ZipFile, ZIP_DEFLATED
 
 from openpyxl import Workbook, load_workbook
 
@@ -165,6 +166,89 @@ class SourceFillTests(unittest.TestCase):
             self.assertEqual(copied["Данные"]["E2"].value, candidate["candidate_name"])
             self.assertEqual(copied["Данные"]["E3"].value, candidate["candidate_name"])
             copied.close()
+
+    def test_conflicting_postal_codes_are_not_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.xlsx"
+            self.make_input(source)
+            original = load_workbook(source)
+            original["Данные"].append([
+                "Петров Пётр", "ГБОУ Школа № 123", "Среднее общее", "00234", "", "", "", ""
+            ])
+            original.save(source)
+            original.close()
+            result, _, _ = self.make_result(source)
+            other = dict(result["resolution"]["groups"][0])
+            other["record_ids"] = [result["records"][1]["record_id"]]
+            other["selected"] = {**other["selected"], "postal_code": "119020"}
+            result["resolution"]["groups"].append(other)
+            prepare_letters(result)
+            self.assertIn("Индексы в источниках не совпадают", result["letters_review"][0]["checks"])
+
+            stats = fill_source_copies(result, Path(tmp) / "out")
+            copied = load_workbook(Path(tmp) / "out" / "filled_sources" / stats["copies"][0]["file"])
+            self.assertIsNone(copied["Данные"]["H2"].value)
+            self.assertIsNone(copied["Данные"]["H3"].value)
+            copied.close()
+
+    def test_unverified_restored_name_is_not_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.xlsx"
+            self.make_input(source)
+            result, _, _ = self.make_result(source)
+            result["resolution"]["groups"][0]["selected"]["candidate_name"] = (
+                "ГОСУДАРСТВЕННОЕ БЮДЖЕТНОЕ ОБЩЕОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ № 123"
+            )
+            prepare_letters(result)
+            self.assertIn("Регистр восстановлен автоматически", result["letters_review"][0]["checks"])
+
+            stats = fill_source_copies(result, Path(tmp) / "out")
+            copied = load_workbook(Path(tmp) / "out" / "filled_sources" / stats["copies"][0]["file"])
+            self.assertIsNone(copied["Данные"]["E2"].value)
+            copied.close()
+
+    def test_conflicting_existing_address_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.xlsx"
+            self.make_input(source)
+            original = load_workbook(source)
+            original["Данные"]["G2"] = "Москва, Тверская улица, дом 1"
+            original.save(source)
+            original.close()
+            result, _, _ = self.make_result(source)
+
+            stats = fill_source_copies(result, Path(tmp) / "out")
+            copied = load_workbook(Path(tmp) / "out" / "filled_sources" / stats["copies"][0]["file"])
+            self.assertEqual(copied["Данные"]["G2"].value, "Москва, Тверская улица, дом 1")
+            copied.close()
+
+    def test_formula_in_other_sheet_blocks_copy_instead_of_losing_cached_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.xlsx"
+            self.make_input(source)
+            original = load_workbook(source)
+            original["Другой лист"]["C3"] = "=1+1"
+            original.save(source)
+            original.close()
+            with ZipFile(source) as archive:
+                parts = {name: archive.read(name) for name in archive.namelist()}
+            sheet_xml = parts["xl/worksheets/sheet2.xml"]
+            parts["xl/worksheets/sheet2.xml"] = sheet_xml.replace(b"<v></v>", b"<v>2</v>").replace(
+                b"<v />", b"<v>2</v>"
+            )
+            with ZipFile(source, "w", ZIP_DEFLATED) as archive:
+                for name, content in parts.items():
+                    archive.writestr(name, content)
+            original = load_workbook(source, data_only=True)
+            self.assertEqual(original["Другой лист"]["C3"].value, 2)
+            original.close()
+
+            stats = fill_source_copies(self.make_result(source)[0], Path(tmp) / "out")
+            self.assertEqual(stats["copy_count"], 0)
+            self.assertTrue(any("формул" in error.lower() for error in stats["errors"]))
+            original = load_workbook(source, data_only=True)
+            self.assertEqual(original["Другой лист"]["C3"].value, 2)
+            original.close()
 
     def test_full_export_has_required_sheets_and_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
