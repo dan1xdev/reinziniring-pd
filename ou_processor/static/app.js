@@ -145,7 +145,15 @@ $('forget-token').onclick = async () => {
 };
 function renderResult(job) {
   $('result').hidden = false; $('download').href = job.download;
-  $('result-title').textContent = job.partial ? 'Таблица готова, есть ошибки поиска' : 'Таблица готова';
+  $('filled-downloads').replaceChildren();
+  for (const source of job.filled_sources || []) {
+    const link = document.createElement('a');
+    link.href = source.url;
+    link.download = source.source;
+    link.textContent = `Скачать заполненную копию: ${source.source}`;
+    $('filled-downloads').append(link, document.createElement('br'));
+  }
+  $('result-title').textContent = job.partial ? 'Таблица готова частично' : 'Таблица готова';
   $('metrics').replaceChildren();
   for (const [value, label] of [[job.summary.rows,'строк обработано'],[job.summary.schools,'учреждений объединено'],[job.summary.students,'пар ФИО и номер дела'],[job.summary.review,'строк требуют проверки']]) {
     const box = document.createElement('div'), number = document.createElement('strong'), text = document.createElement('span');

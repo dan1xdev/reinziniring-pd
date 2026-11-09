@@ -64,7 +64,12 @@ def _letter_values(letter):
         return {}
 
     checks = set(str(letter.get("checks") or "").splitlines())
-    official_conflict = "Официальные названия не совпадают" in checks
+    official_conflict = bool(checks & {
+        "Официальные названия не совпадают",
+        "Регистр восстановлен автоматически — проверить",
+        "Регистр отдельных слов требует проверки",
+        "Несбалансированные кавычки в названии",
+    })
     address_conflict = "Адреса в источниках не совпадают" in checks
 
     official_name = "" if official_conflict else str(letter.get("official_name") or "").strip()
@@ -73,7 +78,9 @@ def _letter_values(letter):
         genitive_name = str(letter.get("genitive_name") or "").strip()
 
     address = "" if address_conflict else str(letter.get("address") or "").strip()
-    postal_code = str(letter.get("postal_code") or "").strip()
+    postal_code = "" if "Индексы в источниках не совпадают" in checks else str(
+        letter.get("postal_code") or ""
+    ).strip()
     if not re.fullmatch(r"\d{6}", postal_code):
         postal_code = ""
 
@@ -200,6 +207,19 @@ def _target_columns(sheet, header_row):
     return columns
 
 
+def _has_formulas(path):
+    book = load_workbook(path, read_only=True, data_only=False)
+    try:
+        return any(
+            cell.data_type == "f"
+            for sheet in book
+            for row in sheet
+            for cell in row
+        )
+    finally:
+        book.close()
+
+
 def fill_source_copies(result, output):
     """Создаёт отдельные заполненные копии исходных книг, не меняя оригиналы."""
     output = Path(output)
@@ -227,6 +247,12 @@ def fill_source_copies(result, output):
         if not source_path or not source_path.is_file():
             stats["errors"].append(
                 f"Не найдена исходная книга для источника {source.get('file') or source_id}."
+            )
+            continue
+
+        if _has_formulas(source_path):
+            stats["errors"].append(
+                f"{source_path.name}: копия не создана из-за формул в исходной книге."
             )
             continue
 
@@ -263,6 +289,10 @@ def fill_source_copies(result, output):
                     value = str(item["values"].get(field) or "").strip()
                     # Пустое или неподтверждённое значение не стирает исходные данные.
                     if value:
+                        if field == "address" and cell.value is not None and str(cell.value).strip():
+                            if normalize(cell.value) != normalize(value):
+                                field_present[field] += 1
+                                continue
                         cell.value = value
                         cell.data_type = "s"
                         cell.number_format = "@"

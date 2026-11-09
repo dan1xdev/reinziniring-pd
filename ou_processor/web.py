@@ -257,8 +257,13 @@ class Application:
                          'students': len(result['students']), 'review': issues,
                          'addresses': summary['Учреждений с адресом'],
                          'excluded': result['summary']['excluded_rows']},
-                warnings=warnings, partial=bool(errors), preview=result['schools'][:20],
-                download=f'/api/jobs/{job_id}/download')
+                warnings=warnings, partial=bool(errors or source_fill.get('errors')), preview=result['schools'][:20],
+                download=f'/api/jobs/{job_id}/download',
+                filled_sources=[{
+                    'source': item['source'],
+                    'file': item['file'],
+                    'url': f'/api/jobs/{job_id}/filled-sources/{index}',
+                } for index, item in enumerate(source_fill.get('copies', []))])
         except JobCancelled:
             was_cancelled = True
         except (UserError, ValueError) as error:
@@ -308,7 +313,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
         if attachment:
-            self.send_header('Content-Disposition', 'attachment; filename="schools.xlsx"')
+            name = attachment if isinstance(attachment, str) else 'schools.xlsx'
+            self.send_header('Content-Disposition', f'attachment; filename="{name}"')
         self.end_headers()
         self.wfile.write(data)
 
@@ -323,6 +329,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, (ROOT / 'ou_processor' / 'static' / name).read_bytes(), content_type)
         if self.path == '/api/config':
             return self.send(200, self.app.settings())
+        filled_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/filled-sources/([0-9]+)', self.path)
+        if filled_match:
+            job = self.app.snapshot(filled_match[1])
+            if job and job['status'] != 'done':
+                return self.send(409, {'error': 'Результат ещё не готов.'})
+            copies = job.get('filled_sources', []) if job else []
+            index = int(filled_match[2])
+            if index >= len(copies):
+                return self.send(404, {'error': 'Копия не найдена.'})
+            name = copies[index]['file']
+            if Path(name).name != name or not name.endswith('.xlsx'):
+                return self.send(404, {'error': 'Копия не найдена.'})
+            path = self.app.storage / filled_match[1] / 'result' / 'filled_sources' / name
+            if not path.is_file():
+                return self.send(404, {'error': 'Копия не найдена.'})
+            return self.send(200, path.read_bytes(),
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                attachment=f'filled_source_{index + 1}.xlsx')
         match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download)?', self.path)
         if match:
             job = self.app.snapshot(match[1])
