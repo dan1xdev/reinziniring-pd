@@ -194,8 +194,16 @@ $('forget-token').onclick = async () => {
 };
 function renderResult(job) {
   $('result').hidden = false; $('download').href = job.download;
+  $('filled-downloads').replaceChildren();
+  for (const source of job.filled_sources || []) {
+    const link = document.createElement('a');
+    link.href = source.url;
+    link.download = source.source;
+    link.textContent = `Скачать заполненную копию: ${source.source}`;
+    $('filled-downloads').append(link, document.createElement('br'));
+  }
   $('journal').href = job.journal; $('journal').hidden = !job.journal;
-  $('result-title').textContent = job.partial ? 'Таблица готова, есть ошибки поиска' : 'Таблица готова';
+  $('result-title').textContent = job.partial ? 'Таблица готова частично' : 'Таблица готова';
   $('metrics').replaceChildren();
   for (const [value, label] of [[job.summary.rows,'строк обработано'],[job.summary.schools,'учреждений объединено'],[job.summary.students,'пар ФИО и номер дела'],[job.summary.review,'строк требуют проверки']]) {
     const box = document.createElement('div'), number = document.createElement('strong'), text = document.createElement('span');
@@ -203,7 +211,7 @@ function renderResult(job) {
   }
   $('warnings').replaceChildren();
   const warnings = [...job.warnings];
-  if (job.summary.review) warnings.push('Неоднозначные записи сохранены отдельно. Посмотрите лист «Проверить» и причины отбора на листе «Исходные записи».');
+  if (job.summary.review) warnings.push('Неоднозначные записи сохранены отдельно. Посмотрите лист «Ручная проверка» и причины отбора на листе «Исходные записи».');
   if (job.summary.excluded) warnings.push(`Исключено по правилам отбора: ${job.summary.excluded}. Причины сохранены на листе «Исходные записи».`);
   for (const warning of warnings) { const p = document.createElement('p'); p.className = 'notice'; p.textContent = warning; $('warnings').append(p); }
   $('preview').replaceChildren();

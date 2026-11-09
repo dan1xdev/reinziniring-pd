@@ -33,6 +33,72 @@ def school_upload():
 
 
 class UploadTests(unittest.TestCase):
+    def test_filled_source_is_listed_and_downloadable(self):
+        class Probe:
+            def __init__(self, app, path):
+                self.app = app
+                self.path = path
+                self.response = None
+
+            def trusted(self):
+                return True
+
+            def send(self, status, body, content_type='application/json; charset=utf-8', attachment=False):
+                self.response = (status, body, content_type, attachment)
+
+        with tempfile.TemporaryDirectory() as root:
+            app = Application(Path(root) / 'runs', Path(root) / 'registry', Path(root) / 'cache.json')
+            job_id = app.start({'files': [school_upload()], 'offline': True})
+            for _ in range(500):
+                if app.snapshot(job_id)['status'] != 'running':
+                    break
+                time.sleep(.01)
+            job = app.snapshot(job_id)
+            self.assertEqual(job['status'], 'done', job.get('error'))
+            self.assertEqual(len(job['filled_sources']), 1)
+            probe = Probe(app, job['filled_sources'][0]['url'])
+            Handler.do_GET(probe)
+            self.assertEqual(probe.response[0], 200)
+            self.assertTrue(probe.response[3])
+            downloaded = load_workbook(io.BytesIO(probe.response[1]))
+            self.assertEqual(downloaded.sheetnames, ['Sheet'])
+            downloaded.close()
+
+            unknown = Probe(app, f'/api/jobs/{job_id}/filled-sources/99')
+            Handler.do_GET(unknown)
+            self.assertEqual(unknown.response[0], 404)
+
+    def test_formula_book_is_reported_as_partial_result(self):
+        workbook = Workbook()
+        workbook.active.append(['Образовательное учреждение', 'Вид образования', 'ФИО', 'Личное дело.Номер'])
+        workbook.active.append(['ГБОУ г. Москвы «Школа № 1»', 'Среднее общее', 'Иванов Иван', '0001'])
+        workbook.create_sheet('Расчёты')['A1'] = '=1+1'
+        stream = io.BytesIO()
+        workbook.save(stream)
+        payload = {'name': 'formulas.xlsx', 'data': base64.b64encode(stream.getvalue()).decode()}
+        with tempfile.TemporaryDirectory() as root:
+            cache = {
+                'ГБОУ г. Москвы «Школа № 1» Москва': {
+                    'status': 'OK',
+                    'candidates': [dict(candidate_inn='123', candidate_name='ГБОУ школа № 1',
+                        candidate_ogrn='456', postal_code='123456', region='Москва', city='Москва',
+                        address='Москва, ул А, д 1', legal_status='ACTIVE', branch_type='MAIN',
+                        source='DaData')],
+                },
+            }
+            (Path(root) / 'cache.json').write_text(json.dumps(cache), encoding='utf-8')
+            app = Application(Path(root) / 'runs', Path(root) / 'registry', Path(root) / 'cache.json')
+            job_id = app.start({'files': [payload], 'offline': True})
+            for _ in range(500):
+                if app.snapshot(job_id)['status'] != 'running':
+                    break
+                time.sleep(.01)
+            job = app.snapshot(job_id)
+            self.assertEqual(job['status'], 'done', job.get('error'))
+            self.assertTrue(job['partial'])
+            self.assertEqual(job['filled_sources'], [])
+            self.assertTrue(any('формул' in text.lower() for text in job['warnings']))
+
     # Порог из файла настроек текущего запуска влияет на подбор и итоговый Excel.
     def test_processing_uses_current_config_threshold(self):
         config = json.loads((Path(__file__).resolve().parents[1] / 'config.json').read_text(encoding='utf-8'))

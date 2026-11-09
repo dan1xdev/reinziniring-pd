@@ -270,6 +270,17 @@ class Application:
             errors = [r['status'] for r in result['resolution']['requests'] if r['status'] != 'OK']
             issues = summary['Исходных строк на проверку'] + result['summary']['selection_review_rows']
             warnings = list(result['warnings'])
+            source_fill = result.get('source_fill', {})
+            if source_fill.get('copy_count'):
+                warnings.append(
+                    f"Созданы заполненные копии исходных книг: {source_fill['copy_count']}. "
+                    f"Они сохранены в ui_runs/{job_id}/result/filled_sources; оригиналы не изменены."
+                )
+            if source_fill.get('errors'):
+                warnings.append(
+                    'Не все копии исходных книг удалось заполнить: '
+                    + '; '.join(source_fill['errors'])
+                )
             missing = summary['Строк без данных ученика']
             if missing:
                 warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
@@ -278,8 +289,14 @@ class Application:
                          'students': len(result['students']), 'review': issues,
                          'addresses': summary['Учреждений с адресом'],
                          'excluded': result['summary']['excluded_rows']},
-                warnings=warnings, partial=bool(errors), preview=result['schools'][:20],
-                download=f'/api/jobs/{job_id}/download', journal=f'/api/jobs/{job_id}/journal')
+                warnings=warnings, partial=bool(errors or source_fill.get('errors')), preview=result['schools'][:20],
+                download=f'/api/jobs/{job_id}/download',
+                journal=f'/api/jobs/{job_id}/journal',
+                filled_sources=[{
+                    'source': item['source'],
+                    'file': item['file'],
+                    'url': f'/api/jobs/{job_id}/filled-sources/{index}',
+                } for index, item in enumerate(source_fill.get('copies', []))])
         except JobCancelled:
             was_cancelled = True
         except (UserError, ValueError) as error:
@@ -343,6 +360,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, (ROOT / 'ou_processor' / 'static' / name).read_bytes(), content_type)
         if self.path == '/api/config':
             return self.send(200, self.app.settings())
+        filled_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/filled-sources/([0-9]+)', self.path)
+        if filled_match:
+            job = self.app.snapshot(filled_match[1])
+            if job and job['status'] != 'done':
+                return self.send(409, {'error': 'Результат ещё не готов.'})
+            copies = job.get('filled_sources', []) if job else []
+            index = int(filled_match[2])
+            if index >= len(copies):
+                return self.send(404, {'error': 'Копия не найдена.'})
+            name = copies[index]['file']
+            if Path(name).name != name or not name.endswith('.xlsx'):
+                return self.send(404, {'error': 'Копия не найдена.'})
+            path = self.app.storage / filled_match[1] / 'result' / 'filled_sources' / name
+            if not path.is_file():
+                return self.send(404, {'error': 'Копия не найдена.'})
+            return self.send(200, path.read_bytes(),
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                attachment=f'filled_source_{index + 1}.xlsx')
         match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download|/journal)?', self.path)
         if match:
             job = self.app.snapshot(match[1])
