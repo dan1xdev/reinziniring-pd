@@ -23,7 +23,7 @@ import tempfile
 import time
 import csv
 from urllib.error import HTTPError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 import zipfile
 
@@ -201,8 +201,13 @@ def records_from_xlsx(stream):
 RECORD_READERS = {"xml": records_from_xml, "csv": records_from_csv, "xlsx": records_from_xlsx}
 
 
-def records_from_export(path):
+def records_from_export(path, format_hint=""):
     """Определяет формат официальной выгрузки и выдаёт из неё записи."""
+    kind = format_hint.lower().lstrip(".") or path.suffix.lower().lstrip(".")
+    if kind == "xlsx":
+        with open(path, "rb") as stream:
+            yield from records_from_xlsx(stream)
+        return
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
             data = [member for member in archive.infolist() if not member.is_dir()
@@ -215,11 +220,11 @@ def records_from_export(path):
                 yield from RECORD_READERS[kind](stream)
         return
     with open(path, "rb") as stream:
-        reader = RECORD_READERS.get(path.suffix.lower().lstrip("."), records_from_xml)
+        reader = RECORD_READERS.get(kind, records_from_xml)
         yield from reader(stream)
 
 
-def build_index(source_path, database_path):
+def build_index(source_path, database_path, format_hint=""):
     """Собирает SQLite-индекс лицензий из официальной выгрузки."""
     connection = sqlite3.connect(database_path)
     records = 0
@@ -228,7 +233,7 @@ def build_index(source_path, database_path):
             inn TEXT, ogrn TEXT, kpp TEXT, full_name TEXT, short_name TEXT,
             license_number TEXT, date_start TEXT, status TEXT, region TEXT,
             address TEXT, search_name TEXT)""")
-        for fields in records_from_export(source_path):
+        for fields in records_from_export(source_path, format_hint):
             full_name = fields.get("full_name", "")
             if not full_name and not fields.get("inn"):
                 continue
@@ -400,6 +405,7 @@ def update(cache, keep=None, force=False, opener=urlopen, settings=None):
             source = resolve_source(settings, opener)
             is_local = "file" in source
             url = source.get("file", source.get("url", ""))
+            source_format = Path(urlsplit(url).path).suffix.lower().lstrip(".")
             remote = {} if is_local else remote_metadata(source["url"], opener)
             if current and not force and not is_local and unchanged(remote, current[1]) \
                     and current[1].get("source_url") == source["url"]:
@@ -423,7 +429,7 @@ def update(cache, keep=None, force=False, opener=urlopen, settings=None):
                               "source_url": url, "manifest": current[1], "verified_download": True}
                     write_json_atomic(cache / "last_check.json", report)
                     return report
-                details = build_index(directory / DATA_FILE, directory / "index.sqlite")
+                details = build_index(directory / DATA_FILE, directory / "index.sqlite", source_format)
                 date_match = re.search(r"data-(\d{8})-", url)
                 snapshot_date = date_match.group(1) if date_match else time.strftime("%Y%m%d")
                 metadata = {"source_kind": "license_registry",

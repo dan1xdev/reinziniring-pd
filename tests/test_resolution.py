@@ -99,6 +99,70 @@ class ResolutionTests(unittest.TestCase):
         self.assertTrue(group['license_used'])
         self.assertEqual(group['selected']['candidate_inn'], '123')
 
+    # Без ключа DaData отсутствие записи в обоих реестрах оставляет группу на проверке.
+    def test_missing_license_with_no_dadata_client_finishes_without_requests(self):
+        class Licenses:
+            metadata = {}
+
+            def search(self, source_record):
+                return [], False
+
+        result = {'records': [record(record_id='1')],
+                  'groups': [dict(group_id='g', record_ids=['1'])]}
+        resolve(result, None, None, progress=False, licenses=Licenses())
+        self.assertEqual(result['resolution']['groups'][0]['status'], 'НЕ_НАЙДЕНО')
+        self.assertEqual(result['resolution']['actual_requests'], 0)
+        self.assertEqual(result['resolution']['requests'], [])
+
+    # Неоднозначность основного реестра нельзя снять посторонним ИНН из DaData.
+    def test_dadata_cannot_override_ambiguous_license_with_another_inn(self):
+        class Licenses:
+            metadata = {}
+
+            def search(self, source_record):
+                return [{**candidate(inn='111'), 'source': 'Реестр лицензий'},
+                        {**candidate(inn='222'), 'source': 'Реестр лицензий'}], False
+
+        class API:
+            actual_requests = 1
+            requests = []
+
+            def search(self, query, group_id):
+                return [candidate(inn='333')]
+
+        result = {'records': [record(record_id='1')],
+                  'groups': [dict(group_id='g', record_ids=['1'])]}
+        resolve(result, API(), None, progress=False, licenses=Licenses())
+        self.assertIsNone(result['resolution']['groups'][0]['selected'])
+        self.assertEqual(result['resolution']['groups'][0]['status'], 'ПРОВЕРИТЬ_ОТРЫВ')
+
+    # Совпадение двух вспомогательных источников не должно скрыть конфликт с основным.
+    def test_secondary_sources_cannot_hide_ambiguous_license_inns(self):
+        class Licenses:
+            metadata = {}
+
+            def search(self, source_record):
+                return [{**candidate(inn='111'), 'source': 'Реестр лицензий'},
+                        {**candidate(inn='222'), 'source': 'Реестр лицензий'}], False
+
+        class API:
+            actual_requests = 1
+            requests = []
+
+            def search(self, query, group_id):
+                return [candidate(inn='333')]
+
+        class Registry:
+            metadata = {}
+
+            def search(self, source_record):
+                return [{**candidate(inn='333'), 'source': 'Реестр аккредитации'}], False
+
+        result = {'records': [record(record_id='1')],
+                  'groups': [dict(group_id='g', record_ids=['1'])]}
+        resolve(result, API(), Registry(), progress=False, licenses=Licenses())
+        self.assertIsNone(result['resolution']['groups'][0]['selected'])
+
     def test_successful_primary_skips_registry(self):
         class API:
             actual_requests=1
