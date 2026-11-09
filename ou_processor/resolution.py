@@ -331,18 +331,6 @@ def choose(record, candidates, config=None):
 
     eligible_inns = {c['candidate_inn'] for c in ranked if c['eligible']}
 
-    # Уточнение точным названием в кавычках при наличии нескольких подходящих
-    quoted = re.findall(r'[«"]([^»"]+)[»"]', record['name'])
-    exact_quoted = False
-    if len(eligible_inns) > 1 and quoted:
-        title = normalize(max(quoted, key=len))
-        exact = [c for c in ranked if c['eligible'] and any(
-            normalize(part) == title for part in re.findall(r'[«"]([^»"]+)[»"]', c['candidate_name']))]
-        if len({c['candidate_inn'] for c in exact}) == 1:
-            eligible_inns = {exact[0]['candidate_inn']}
-            ranked = exact + [c for c in ranked if c not in exact]
-            exact_quoted = True
-
     # Проверка отрыва кандидатов (margin)
     margin_threshold = thresholds.get("candidate_margin", 15.0)
     best_by_inn = {}
@@ -356,8 +344,7 @@ def choose(record, candidates, config=None):
     if len(sorted_distinct) >= 2:
         top1 = sorted_distinct[0]
         top2 = sorted_distinct[1]
-        exact_inn = record.get('inn_raw') and record['inn_raw'] == top1['candidate_inn']
-        if not exact_inn and not exact_quoted and (top1['score'] - top2['score'] < margin_threshold):
+        if top1['score'] - top2['score'] < margin_threshold:
             # Неясность между лидерами запрещает выбирать и любого следующего кандидата.
             for c in ranked:
                 if c['eligible'] or c['candidate_inn'] in (top1['candidate_inn'], top2['candidate_inn']):

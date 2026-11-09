@@ -302,14 +302,13 @@ class ResolutionTests(unittest.TestCase):
             candidate(name='Первичная профсоюзная организация Московский колледж')])
         self.assertIsNone(selected)
 
-    def test_exact_title_beats_extended_title(self):
+    def test_exact_title_requires_margin_from_extended_title(self):
         r=record(name='ГАПОУ "Губернский колледж"',city='',region='Московская область')
         base={**candidate(),'region':'Московская обл','source':'Реестр аккредитации','legal_status':'Действующее'}
         exact={**base,'candidate_name':'ГАПОУ "Губернский колледж"','scope':'actual_organization'}
         other={**base,'candidate_inn':'789','candidate_name':'ГАПОУ "Московский губернский колледж искусств"','scope':'actual_organization'}
         selected,_=choose(r,[other,exact])
-        self.assertEqual(selected['candidate_inn'],'123')
-        self.assertEqual(selected['candidate_name'],exact['candidate_name'])
+        self.assertIsNone(selected)
 
     def test_candidate_margin_triggers_review_when_small_difference(self):
         # Два кандидата с разными ИНН, один 95 баллов, второй 90 баллов (разница 5 < 15)

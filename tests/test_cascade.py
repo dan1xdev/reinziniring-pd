@@ -92,3 +92,12 @@ class CascadeTests(unittest.TestCase):
         result, _ = self.run_cascade([], [extra])
         self.assertIsNone(result['resolution']['groups'][0]['selected'])
         self.assertEqual(result['resolution']['groups'][0]['status'], 'ВРУЧНАЯ')
+
+    def test_exact_quoted_name_does_not_bypass_required_margin(self):
+        from ou_processor.resolution import choose
+        source = record(name='ГБОУ «Школа № 1»')
+        rows = [candidate(inn='111', name='ГБОУ «Школа № 1»'),
+                candidate(inn='222', name='ГБОУ «Средняя школа № 1»')]
+        selected, ranked = choose(source, rows)
+        self.assertIsNone(selected)
+        self.assertTrue(all('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ' in row['reasons'] for row in ranked))
