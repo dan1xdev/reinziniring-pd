@@ -270,6 +270,11 @@ class SourceFillTests(unittest.TestCase):
                 "cached": False, "timestamp_utc": "2026-11-08T00:00:00Z",
             }]
             result["resolution"]["actual_requests"] = 1
+            result["dadata_checks"] = [
+                {"status": "КОНФЛИКТ_ИНН", "group_id": "G-1"},
+                {"status": "СОВПАДАЕТ", "group_id": "G-2"},
+            ]
+            result["dadata_candidates"] = []
             save(result, output)
 
             report = load_workbook(output / "schools.xlsx", data_only=True)
@@ -283,6 +288,8 @@ class SourceFillTests(unittest.TestCase):
             self.assertEqual(summary["Создано копий исходных книг"], 1)
             self.assertEqual(summary["DaData — записей запросов"], 1)
             self.assertEqual(summary["DaData — ошибок и пропусков"], 1)
+            self.assertEqual(summary["DaData — кандидатов получено"], 0)
+            self.assertEqual(summary["DaData — сверок КОНФЛИКТ_ИНН"], 1)
             self.assertEqual(summary["Дубли удалены до обработки"], 0)
             self.assertIn("Заполнено в копиях — Индекс", summary)
             manual_types = [row[0] for row in report["Ручная проверка"].iter_rows(min_row=2, values_only=True)]

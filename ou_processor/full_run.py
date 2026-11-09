@@ -9,8 +9,12 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
+import zipfile
+from xml.etree.ElementTree import ParseError
 
 from openpyxl import Workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 from .dadata import DaDataClient
 from .export import add_table, RECORD_COLUMNS
@@ -19,11 +23,11 @@ from .letters import (
     postal_details,
     LETTER_COLUMNS,
 )
-from .input import read_records
+from .input import list_sheets, read_records
 from .normalization import normalize
 from .pipeline import process
-from .resolution import RegistrySearch, SearchCache, resolve
 from .source_fill import fill_source_copies
+from .workflow import search, write_log
 
 
 def aggregate(result):
@@ -225,7 +229,9 @@ def aggregate(result):
                 "Адрес отсутствует или есть противоречие — проверить"
             )
 
-        if candidate["source"] != "DaData":
+        if candidate["source"] == "Реестр лицензий":
+            notes.append("Адрес из реестра лицензий; актуальность адреса не подтверждена")
+        elif candidate["source"] != "DaData":
             notes.append(
                 "Адрес реестра аккредитации; "
                 "актуальность юридического адреса "
@@ -313,6 +319,11 @@ def aggregate(result):
             students
         ),
         "Групп на проверку": len(review),
+        "Групп сопоставлено через реестр лицензий": sum(
+            bool(group["selected"])
+            and group["selected"]["source"] == "Реестр лицензий"
+            for group in groups
+        ),
         "Групп сопоставлено через DaData": sum(
             bool(group["selected"])
             and group["selected"]["source"] == "DaData"
@@ -326,6 +337,9 @@ def aggregate(result):
         "Групп проверено по реестру": sum(
             group["registry_used"]
             for group in groups
+        ),
+        "Групп проверено по реестру лицензий": sum(
+            bool(group.get("license_used")) for group in groups
         ),
         "Запросов DaData в этом запуске":
             result["resolution"]["actual_requests"],
@@ -467,7 +481,10 @@ def _extend_task6_summary(result, source_fill):
     )
     summary["DaData — реальных внешних обращений"] = result.get("resolution", {}).get("actual_requests", 0)
     summary["DaData — запросов из кэша"] = sum(bool(row.get("cached")) for row in requests)
-    summary["DaData — кандидатов получено"] = len(result.get("resolution", {}).get("candidates", []))
+    summary["DaData — кандидатов получено"] = len(result.get("dadata_candidates", []))
+    check_statuses = Counter(row.get("status", "НЕИЗВЕСТНО") for row in result.get("dadata_checks", []))
+    for status, count in sorted(check_statuses.items()):
+        summary[f"DaData — сверок {status}"] = count
 
     for index, item in enumerate(source_fill.get("copies", []), 1):
         summary[f"Копия исходного файла {index}"] = item.get("file", "")
@@ -592,6 +609,7 @@ def save(result, output, overrides=None):
             ("reason", "Что уточнить"),
             ("top_candidates", "Первые три кандидата"),
             ("candidate_count", "Кандидатов"),
+            ("license_used", "Проверен реестр лицензий"),
             ("registry_used", "Проверен реестр"),
             ("registry_truncated", "Выдача ограничена"),
             ("group_id", "Группа"),
@@ -635,10 +653,18 @@ def save(result, output, overrides=None):
             "value": result["created_at_utc"],
         },
         {
+            "metric": "Дата снимка реестра лицензий",
+            "value": result["resolution"].get("license", {}).get("snapshot_date", ""),
+        },
+        {
             "metric": "Дата снимка реестра",
             "value": result["resolution"]["registry"].get(
                 "snapshot_date", ""
             ),
+        },
+        {
+            "metric": "Реестр лицензий (основной источник)",
+            "value": "https://islod.obrnadzor.gov.ru/opendata_licenses.html",
         },
         {
             "metric": "DaData",
@@ -703,6 +729,15 @@ def save(result, output, overrides=None):
             ("timestamp_utc", "Время UTC"),
         ],
     )
+
+    if 'dadata_checks' in result:
+        add_table(book, 'Сверка DaData', result['dadata_checks'], [
+            ('group_id', 'Группа'), ('registry_inn', 'ИНН из реестра'),
+            ('dadata_inn', 'ИНН DaData'), ('status', 'Результат сверки')])
+        add_table(book, 'Кандидаты сверки DaData', result['dadata_candidates'], [
+            ('group_id', 'Группа'), ('candidate_inn', 'ИНН'), ('candidate_name', 'Название'),
+            ('address', 'Адрес'), ('score', 'Баллы'), ('eligible', 'Прошёл правила'),
+            ('reasons', 'Причины проверки'), ('source_url', 'Источник')])
 
     candidate_groups = defaultdict(list)
 
@@ -783,20 +818,21 @@ def save(result, output, overrides=None):
         encoding="utf-8",
     )
     temporary_json.replace(output / "result.json")
+    write_log(result, output)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument(
         "--output",
         type=Path,
-        required=True,
+        help='Новая или пустая папка результата',
     )
     parser.add_argument(
         "--cache",
         type=Path,
-        required=True,
+        default=Path(__file__).resolve().parents[2] / 'ui_cache' / 'dadata.json',
     )
     parser.add_argument(
         "--registry",
@@ -806,60 +842,65 @@ def main():
             / "registry_cache"
         ),
     )
-    parser.add_argument("--online", action="store_true")
+    parser.add_argument('--licenses', type=Path,
+                        default=Path(__file__).resolve().parents[2] / 'license_registry_cache',
+                        help='Локальный индекс основного реестра лицензий')
+    parser.add_argument('--config', type=Path, default=Path(__file__).resolve().parents[1] / 'config.json')
+    parser.add_argument('--sheet', help='Название рабочего листа во всех входных книгах')
+    parser.add_argument('--list-sheets', action='store_true', help='Показать листы и завершить без обработки')
+    parser.add_argument('--check-dadata', '--online', dest='check_dadata', action='store_true',
+                        help='Отдельно сверить результат в DaData; не менять выбранные ИНН')
     parser.add_argument("--ask-token", action="store_true")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if args.ask_token and not args.check_dadata:
+        parser.error('--ask-token используется только с --check-dadata')
+    if args.list_sheets:
+        try:
+            for path in args.inputs:
+                print(json.dumps({'file': path.name, 'sheets': list_sheets(path)}, ensure_ascii=False))
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, ParseError, InvalidFileException) as error:
+            print(f'Не удалось прочитать список листов: {error}', file=sys.stderr)
+            return 1
+        return 0
+    if args.output is None:
+        parser.error('Укажите --output для обработки')
+    if args.output.exists() and not args.output.is_dir():
+        parser.error('--output должен указывать на папку')
 
     if args.output.exists() and any(args.output.iterdir()):
         parser.error(
             "Папка результата должна быть новой или пустой"
         )
 
-    if args.ask_token and not args.online:
-        parser.error("--ask-token требует --online")
-
-    config = json.loads(
-        (
-            Path(__file__).resolve().parents[1]
-            / "config.json"
-        ).read_text()
-    )
-
-    records, sources = read_records(args.inputs)
-    result = process(records, config)
-
-    result.update(
-        sources=sources,
-        created_at_utc=datetime.now(
-            timezone.utc
-        ).isoformat(),
-    )
-
-    token = (
-        getpass.getpass("API-токен DaData: ")
-        if args.ask_token
-        else os.environ.get("DADATA_API_KEY", "")
-    )
-
-    if args.online and not token:
-        parser.error(
-            "Нужен DADATA_API_KEY или --ask-token"
-        )
-
-    api = SearchCache(
-        args.cache,
-        DaDataClient(token) if args.online else None,
-    )
-
-    registry = RegistrySearch(args.registry, config=config)
-
     try:
-        resolve(result, api, registry, config=config)
+        config = json.loads(args.config.read_text(encoding='utf-8'))
+        records, sources = read_records(args.inputs, sheet_name=args.sheet)
+        result = process(records, config)
+        result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
+        client = None
+        if args.check_dadata:
+            token = getpass.getpass('API-ключ DaData: ') if args.ask_token else os.environ.get('DADATA_API_KEY', '')
+            if not token.strip():
+                parser.error('Для --check-dadata нужен DADATA_API_KEY или --ask-token')
+            client = DaDataClient(token.strip())
+
+        def progress(done, total):
+            print(f'Обработано групп: {done}/{total}', file=sys.stderr, flush=True)
+
+        search(result, args.registry, config, licenses_path=args.licenses,
+               cache=args.cache, client=client, on_progress=progress)
         aggregate(result)
         save(result, args.output)
-    finally:
-        registry.connection.close()
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, ParseError, InvalidFileException) as error:
+        print(f'Ошибка обработки: {error}', file=sys.stderr)
+        return 1
+
+    for warning in result['warnings']:
+        print(warning, file=sys.stderr)
+    print(f'Excel: {args.output / "schools.xlsx"}')
+    print(f'Журнал: {args.output / "processing_log.json"}')
 
     print(
         json.dumps(
