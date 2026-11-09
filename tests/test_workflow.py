@@ -24,6 +24,8 @@ from ou_processor.workflow import search
 
 
 CONFIG = json.loads((Path(__file__).resolve().parents[1] / 'config.json').read_text(encoding='utf-8'))
+# Старый резерв проверяется отдельно и включается только явно.
+CONFIG['allow_accreditation_fallback'] = True
 
 
 def upload(name='input.xlsx'):
@@ -76,12 +78,21 @@ def wait_job(app, job_id):
 
 
 class WorkflowTests(unittest.TestCase):
+    def setUp(self):
+        # Локальный секрет окружения не должен запускать сеть в синтетических тестах.
+        environment = patch.dict(os.environ, {'DADATA_API_KEY': ''})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_license_is_primary_and_does_not_read_dadata(self):
         with patch('ou_processor.workflow.LicenseSearch', Licenses), patch(
                 'ou_processor.workflow.RegistrySearch', Registry), patch(
                 'ou_processor.workflow.SearchCache', side_effect=AssertionError('Кэш DaData не нужен')):
             calculated = search(result(), 'accreditation', CONFIG, licenses_path='licenses')
-        chosen = calculated['resolution']['groups'][0]['selected']
+        group = calculated['resolution']['groups'][0]
+        self.assertIsNone(group['selected'])
+        self.assertEqual(group['status'], 'ПРОВЕРИТЬ')
+        chosen = group['review_candidate']
         self.assertEqual(chosen['candidate_inn'], '2222222222')
         self.assertEqual(chosen['source'], 'Реестр лицензий')
         self.assertEqual(calculated['resolution']['requests'], [])
@@ -107,7 +118,9 @@ class WorkflowTests(unittest.TestCase):
                 'ou_processor.workflow.RegistrySearch', BrokenBackup):
             calculated = search(process(records, CONFIG), 'accreditation', CONFIG, licenses_path='licenses')
 
-        selected = [group['selected'] for group in calculated['resolution']['groups']]
+        groups = calculated['resolution']['groups']
+        self.assertTrue(all(group['selected'] is None for group in groups))
+        selected = [group['review_candidate'] for group in groups]
         self.assertEqual([item['candidate_inn'] if item else '' for item in selected],
                          ['2222222222', ''])
         self.assertTrue(any('резервного реестра' in warning for warning in calculated['warnings']))
@@ -116,9 +129,21 @@ class WorkflowTests(unittest.TestCase):
         with patch('ou_processor.workflow.RegistrySearch', Registry), patch(
                 'ou_processor.workflow.SearchCache', side_effect=AssertionError('Кэш DaData не нужен')):
             calculated = search(result(), 'unused', CONFIG)
-        self.assertEqual(calculated['resolution']['groups'][0]['selected']['candidate_inn'], '1111111111')
+        group = calculated['resolution']['groups'][0]
+        self.assertIsNone(group['selected'])
+        self.assertEqual(group['status'], 'ПРОВЕРИТЬ')
+        self.assertEqual(group['review_candidate']['candidate_inn'], '1111111111')
         self.assertEqual(calculated['resolution']['requests'], [])
         self.assertEqual(calculated['resolution']['actual_requests'], 0)
+
+    def test_default_cascade_does_not_consult_accreditation_backup(self):
+        config = {key: value for key, value in CONFIG.items() if key != 'allow_accreditation_fallback'}
+        with patch('ou_processor.workflow.RegistrySearch', side_effect=AssertionError('Резерв не включён')):
+            calculated = search(result(), 'unused', config)
+        group = calculated['resolution']['groups'][0]
+        self.assertEqual(group['status'], 'НЕ_НАЙДЕНО')
+        self.assertFalse(group['registry_used'])
+        self.assertIsNone(group['selected'])
 
     def test_missing_registry_keeps_case_for_operator_without_dadata(self):
         with patch('ou_processor.workflow.RegistrySearch', side_effect=ValueError('нет снимка')), patch(
@@ -145,7 +170,7 @@ class WorkflowTests(unittest.TestCase):
             calculated = search(result(), 'empty', CONFIG)
         self.assertEqual(calculated['resolution']['groups'][0]['status'], 'НЕ_НАЙДЕНО')
 
-    def test_explicit_conflicting_check_preserves_registry_inn(self):
+    def test_explicit_conflicting_check_revokes_registry_selection(self):
         class Cache:
             actual_requests, requests = 1, []
             def __init__(self, *args):
@@ -156,7 +181,9 @@ class WorkflowTests(unittest.TestCase):
                 return [candidate('2222222222', 'DaData')]
         with patch('ou_processor.workflow.RegistrySearch', Registry), patch('ou_processor.workflow.SearchCache', Cache):
             calculated = search(result(), 'unused', CONFIG, cache='unused', client=object())
-        self.assertEqual(calculated['resolution']['groups'][0]['selected']['candidate_inn'], '1111111111')
+        self.assertIsNone(calculated['resolution']['groups'][0]['selected'])
+        self.assertEqual(calculated['resolution']['groups'][0]['status'], 'ВРУЧНАЯ')
+        self.assertEqual(calculated['dadata_checks'][0]['registry_inn'], '1111111111')
         self.assertEqual(calculated['dadata_checks'][0]['status'], 'КОНФЛИКТ_ИНН')
         self.assertEqual(calculated['dadata_checks'][0]['dadata_inn'], '2222222222')
 
@@ -171,20 +198,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(calculated['dadata_checks'][0]['dadata_inn'], '1111111111')
         self.assertEqual(calculated['dadata_checks'][0]['status'], 'ТРЕБУЕТ_ПРОВЕРКИ')
 
-    def test_ui_default_with_saved_token_and_corrupt_cache_never_constructs_client(self):
+    def test_ui_saved_token_runs_dadata_and_reports_corrupt_cache_without_secrets(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'dadata.json').write_text('broken', encoding='utf-8')
+            class Client:
+                def suggest(self, query):
+                    return []
             app = Application(root / 'runs', root / 'registry', root / 'dadata.json', token='secret',
-                              client_factory=lambda _: self.fail('DaData client created'))
+                              client_factory=lambda _: Client())
             data = upload()
             info = app.inspect({'files': [data]})[0]
             job_id = app.start({'files': [data], 'sheets': ['Рабочий']})
             job = wait_job(app, job_id)
             self.assertEqual(job['status'], 'done', job.get('error'))
             log = json.loads((root / 'runs' / job_id / 'result' / 'processing_log.json').read_text())
-            self.assertEqual(log['mode'], 'registry')
-            self.assertEqual(log['dadata_actual_requests'], 0)
+            self.assertEqual(log['mode'], 'cascade')
+            self.assertGreater(log['dadata_actual_requests'], 0)
+            self.assertTrue(any('Кэш DaData' in warning for warning in log['warnings']))
             self.assertEqual(log['sources'][0]['selected_sheet'], 'Рабочий')
             self.assertEqual(log['selection'][0]['source_sheet'], 'Рабочий')
             self.assertNotIn('secret', json.dumps(log))
@@ -274,7 +305,7 @@ class WorkflowTests(unittest.TestCase):
             root = Path(tmp)
             path = root / 'input.xlsx'
             path.write_bytes(base64.b64decode(upload()['data']))
-            with patch.dict(os.environ, {'DADATA_API_KEY': 'ignored-secret'}), patch(
+            with patch.dict(os.environ, {'DADATA_API_KEY': ''}), patch(
                     'ou_processor.full_run.DaDataClient', side_effect=AssertionError('No API')), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                 code = main([str(path), '--sheet', 'Рабочий', '--registry', str(root / 'missing'), '--output', str(root / 'result')])
             self.assertEqual(code, 0)
@@ -285,6 +316,28 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(book['Запросы DaData'].max_row, 1)
             finally:
                 book.close()
+
+    def test_cli_uses_environment_token_for_cascade_without_logging_secret(self):
+        class Client:
+            def __init__(self, token):
+                if token != 'synthetic-token':
+                    raise AssertionError('CLI не передал ключ окружения')
+            def suggest(self, query):
+                return []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'input.xlsx'
+            path.write_bytes(base64.b64decode(upload()['data']))
+            with patch.dict(os.environ, {'DADATA_API_KEY': 'synthetic-token'}), patch(
+                    'ou_processor.full_run.DaDataClient', Client), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                code = main([str(path), '--sheet', 'Рабочий', '--licenses', str(root / 'licenses'),
+                             '--registry', str(root / 'registry'), '--cache', str(root / 'cache.json'),
+                             '--output', str(root / 'result')])
+            self.assertEqual(code, 0)
+            log = json.loads((root / 'result' / 'processing_log.json').read_text())
+            self.assertEqual(log['mode'], 'cascade')
+            self.assertGreater(log['dadata_actual_requests'], 0)
+            self.assertNotIn('synthetic-token', json.dumps(log))
 
     def test_cli_uses_license_registry_without_dadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -298,8 +351,11 @@ class WorkflowTests(unittest.TestCase):
                              '--registry', str(root / 'missing'), '--output', str(root / 'result')])
             result = json.loads((root / 'result' / 'result.json').read_text())
         self.assertEqual(code, 0)
-        self.assertEqual(result['schools'][0]['inn'], '2222222222')
-        self.assertEqual(result['schools'][0]['source'], 'Реестр лицензий')
+        group = result['resolution']['groups'][0]
+        self.assertIsNone(group['selected'])
+        self.assertEqual(group['status'], 'ПРОВЕРИТЬ')
+        self.assertEqual(group['review_candidate']['candidate_inn'], '2222222222')
+        self.assertEqual(group['review_candidate']['source'], 'Реестр лицензий')
 
     def test_ui_uses_license_registry_without_dadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -312,26 +368,32 @@ class WorkflowTests(unittest.TestCase):
                 job = wait_job(app, job_id)
             self.assertEqual(job['status'], 'done', job.get('error'))
             result = json.loads((root / 'runs' / job_id / 'result' / 'result.json').read_text())
-        self.assertEqual(result['schools'][0]['inn'], '2222222222')
+        group = result['resolution']['groups'][0]
+        self.assertIsNone(group['selected'])
+        self.assertEqual(group['status'], 'ПРОВЕРИТЬ')
+        self.assertEqual(group['review_candidate']['candidate_inn'], '2222222222')
 
     def test_real_license_snapshot_is_used_by_cli_and_ui(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             export = root / 'licenses.zip'
-            xml = ('<OpenData><Licenses><License><LicenseRegNumber>Л035-1</LicenseRegNumber>'
-                   '<FullName>Тестовая школа № 1</FullName><INN>0000000001</INN>'
-                   '<OGRN>0000000000001</OGRN><DateStart>2026-01-15</DateStart>'
-                   '<StatusName>Действующая</StatusName><RegionName>Москва</RegionName>'
-                   '<PostAddress>г Москва, улица Тестовая, д 1</PostAddress>'
-                   '</License></Licenses></OpenData>')
+            xml = ('<licenses><license><regNum>Л035-1</regNum>'
+                   '<schoolName>Тестовая школа № 1</schoolName><Inn>0000000001</Inn>'
+                   '<Ogrn>0000000000001</Ogrn><dateLicDoc>15.01.2026</dateLicDoc>'
+                   '<statusName>Действующая</statusName>'
+                   '<lawAddress>г Москва, улица Тестовая, д 1</lawAddress>'
+                   '<supplements><supplement><licensedPrograms><licensedProgram>'
+                   '<eduLevelName>Среднее общее образование</eduLevelName>'
+                   '</licensedProgram></licensedPrograms></supplement></supplements>'
+                   '</license></licenses>')
             with zipfile.ZipFile(export, 'w') as archive:
                 archive.writestr('licenses.xml', xml)
             licenses = root / 'licenses'
             update_licenses(licenses, settings={'source_file': str(export), 'source_page': '', 'update_days': 0})
             book = Workbook()
             book.active.title = 'Рабочий'
-            book.active.append(['Образовательное учреждение', 'Вид образования', 'Регион', 'Город'])
-            book.active.append(['Тестовая школа № 1', 'Среднее общее', 'Москва', 'Москва'])
+            book.active.append(['Образовательное учреждение', 'Вид образования', 'Регион', 'Город', 'ФИО'])
+            book.active.append(['Тестовая школа № 1', 'Среднее общее', 'Москва', 'Москва', 'Синтетический Ученик'])
             path = root / 'input.xlsx'
             book.save(path)
             with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
@@ -339,7 +401,7 @@ class WorkflowTests(unittest.TestCase):
                              '--output', str(root / 'cli-result')])
             cli_result = json.loads((root / 'cli-result' / 'result.json').read_text())
             self.assertEqual(code, 0)
-            self.assertEqual(cli_result['schools'][0]['inn'], '0000000001')
+            self.assertEqual(cli_result['resolution']['license']['source_kind'], 'license_registry')
 
             app = Application(root / 'ui-runs', root / 'missing', root / 'cache.json',
                               licenses=licenses, client_factory=lambda _: self.fail('DaData не нужен'))
@@ -348,7 +410,16 @@ class WorkflowTests(unittest.TestCase):
             job = wait_job(app, job_id)
             self.assertEqual(job['status'], 'done', job.get('error'))
             ui_result = json.loads((root / 'ui-runs' / job_id / 'result' / 'result.json').read_text())
-            self.assertEqual(ui_result['schools'][0]['inn'], '0000000001')
+            for calculated in (cli_result, ui_result):
+                group = calculated['resolution']['groups'][0]
+                self.assertIsNone(group['selected'])
+                self.assertEqual(group['status'], 'ПРОВЕРИТЬ')
+                proposed = group['review_candidate']
+                self.assertEqual(proposed['candidate_inn'], '0000000001')
+                self.assertEqual(proposed['source'], 'Реестр лицензий')
+                self.assertEqual(proposed['education_levels'], ['Среднее общее образование'])
+                self.assertTrue(any(c['candidate_inn'] == '0000000001'
+                                    for c in calculated['resolution']['candidates']))
 
     def test_cli_missing_sheet_returns_clear_error_without_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -180,7 +180,7 @@ class InputExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "input.xlsx"
             workbook = Workbook()
-            workbook.active.append(["Образовательное учреждение", "Вид образования"])
+            workbook.active.append(["Образовательное учреждение", "Вид образования", "ФИО"])
             workbook.active.append(['="Школа №1"', "Среднее общее"])
             workbook.save(path)
             records, _ = read_records([path])

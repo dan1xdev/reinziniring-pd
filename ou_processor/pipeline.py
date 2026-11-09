@@ -120,6 +120,9 @@ def process(records, config):
         record.update(extract_geography(record, config))
         flags = list(record.pop("geo_flags")) + abbreviation_flags(name, config=config)
         flags.extend(record.get("input_flags", []))
+        if any(re.search(pattern, record["normalized_name"], flags=re.IGNORECASE)
+               for pattern in config.get("old_name_patterns", [])):
+            flags.append("УСТАРЕВШЕЕ_НАИМЕНОВАНИЕ")
         
         # --- ОПРЕДЕЛЕНИЕ СТРАНЫ ---
         country_label, country_flags = classify_country(record)

@@ -3,6 +3,7 @@
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,6 +31,24 @@ XML = '''<?xml version="1.0" encoding="UTF-8"?>
 <PostAddress>г Санкт-Петербург, Новая улица, д 2</PostAddress>
 </License>
 </Licenses></OpenData>'''
+
+REAL_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<licenses xmlns="urn:test:licenses"><license>
+<sysGuid>license-1</sysGuid><schoolGuid>school-1</schoolGuid>
+<statusName>Действующая</statusName><schoolName>Тестовая школа № 1</schoolName>
+<shortName>ТШ № 1</shortName><Inn>0000000001</Inn><Ogrn>0000000000001</Ogrn>
+<lawAddress>170000, Россия, Тверская область, г. Тверь, ул. Тестовая, д. 1</lawAddress>
+<orgName>Министерство образования Тверской области</orgName>
+<regNum>Л035-00001-69/00000001</regNum><dateLicDoc>15.01.2026</dateLicDoc>
+<supplements><supplement><licenseFK>license-1</licenseFK><number>1</number>
+<statusName>Valid</statusName><schoolGuid>branch-1</schoolGuid>
+<schoolName>Другой филиал</schoolName><shortName>Филиал</shortName>
+<lawAddress>Москва</lawAddress><numLicDoc>Номер приложения</numLicDoc>
+<licensedPrograms><licensedProgram><eduLevelName>Основное общее образование</eduLevelName>
+<name>Программа, а не школа</name><code>1</code></licensedProgram>
+<licensedProgram><eduLevelName>Среднее общее образование</eduLevelName></licensedProgram>
+<licensedProgram><eduLevelName>Основное общее образование</eduLevelName></licensedProgram>
+</licensedPrograms></supplement></supplements></license></licenses>"""
 
 CSV = '''Наименование лицензиата;ИНН;ОГРН;Номер лицензии;Статус лицензии;Регион;Адрес
 Тестовая школа № 1;0000000001;0000000000001;Л035-00001-77/00000001;Действующая;Москва;г Москва, Тестовая улица, д 1
@@ -69,6 +88,85 @@ class Server:
 
 
 class LicenseRegistryTests(unittest.TestCase):
+    def test_real_schema_preserves_license_and_levels_without_branch_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            report = update(cache, settings={}, opener=Server(archive_bytes(REAL_XML)))
+            self.assertEqual(report["manifest"]["records"], 1)
+            rows = lookup(cache, inn="0000000001")["matches"]
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["full_name"], "Тестовая школа № 1")
+            self.assertEqual(row["license_number"], "Л035-00001-69/00000001")
+            self.assertEqual(row["date_start"], "2026-01-15")
+            self.assertEqual(row["status"], "Действующая")
+            self.assertEqual(row["region"], "Тверская область")
+            self.assertTrue(row["address"].startswith("170000"))
+            self.assertEqual(row["education_levels"], [
+                "Основное общее образование", "Среднее общее образование"])
+            self.assertEqual(lookup(cache, name="филиал")["matches"], [])
+
+    def test_missing_required_columns_rejects_snapshot_and_keeps_previous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            update(cache, settings={}, opener=Server())
+            original = (cache / "current.json").read_bytes()
+            broken = "<licenses><license><Inn>0000000001</Inn><statusName>Действующая</statusName><unknown>1</unknown></license></licenses>"
+            with self.assertRaisesRegex(ValueError, "обязательн"):
+                update(cache, settings={}, opener=Server(archive_bytes(broken), "20261108"))
+            self.assertEqual((cache / "current.json").read_bytes(), original)
+            self.assertEqual(lookup(cache, name="школа")["matches"][0]["full_name"], "Тестовая школа № 1")
+
+    def test_old_index_is_rebuilt_from_verified_archive_without_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            update(cache, settings={}, opener=Server(archive_bytes(REAL_XML)))
+            directory, manifest = current_snapshot(cache)
+            # Имитируем снимок старого парсера с тем же архивом и пустыми полями.
+            old_directory = cache / ("snapshot-20261107-" + manifest["sha256"][:16])
+            if old_directory != directory:
+                directory.rename(old_directory)
+            manifest.pop("index_schema_version", None)
+            (old_directory / "manifest.json").write_text(json.dumps(manifest))
+            (cache / "current.json").write_text(json.dumps({"snapshot": old_directory.name}))
+            with sqlite3.connect(old_directory / "index.sqlite") as db:
+                db.execute("UPDATE licenses SET full_name = '', license_number = ''")
+            def unavailable(request, timeout):
+                self.fail("Для миграции локального архива сеть не нужна")
+            report = update(cache, settings={"update_days": 30}, opener=unavailable)
+            self.assertEqual(report["status"], "updated")
+            self.assertNotEqual(report["snapshot"], old_directory.name)
+            self.assertTrue(old_directory.is_dir())
+            self.assertEqual(lookup(cache, name="школа")["matches"][0]["full_name"], "Тестовая школа № 1")
+
+    def test_partial_records_are_counted_and_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            partial = "<License><FullName>Школа без номера</FullName><INN>0000000003</INN></License>"
+            xml = XML.replace("</Licenses>", partial + "</Licenses>")
+            report = update(cache, settings={}, opener=Server(archive_bytes(xml)))
+            self.assertEqual(report["manifest"]["records"], 2)
+            self.assertEqual(report["manifest"]["rejected_records"], 1)
+            self.assertEqual(lookup(cache, inn="0000000003")["matches"], [])
+
+    def test_damaged_cached_archive_does_not_replace_old_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            update(cache, settings={}, opener=Server())
+            directory, manifest = current_snapshot(cache)
+            manifest.pop("index_schema_version", None)
+            (directory / "manifest.json").write_text(json.dumps(manifest))
+            archive = directory / "source.data"
+            original = archive.read_bytes()
+            archive.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+            pointer = (cache / "current.json").read_bytes()
+            def unavailable(request, timeout):
+                self.fail("Миграция не должна скачивать архив")
+            with self.assertRaisesRegex(ValueError, "Контрольная сумма"):
+                update(cache, settings={}, opener=unavailable)
+            self.assertEqual((cache / "current.json").read_bytes(), pointer)
+            self.assertEqual(lookup(cache, name="школа")["matches"][0]["full_name"], "Тестовая школа № 1")
+
     def test_dynamic_official_link_replaces_stale_archive_text(self):
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d")
         expected = ("https://islod.obrnadzor.gov.ru/opendata-lic/"

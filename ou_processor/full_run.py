@@ -103,7 +103,7 @@ def aggregate(result):
                 "top_candidates": "\n\n".join(
                     f"{c['candidate_inn']} | "
                     f"{c['candidate_name']} | "
-                    f"{c['address']} | {c['source']}"
+                    f"{c['address']} | {c['source']} | балл {c['score']}"
                     for c in top
                 ),
                 "record_ids": "\n".join(
@@ -229,7 +229,9 @@ def aggregate(result):
                 "Адрес отсутствует или есть противоречие — проверить"
             )
 
-        if candidate["source"] == "Реестр лицензий":
+        if candidate.get('address_source') == 'DaData':
+            pass
+        elif candidate["source"] == "Реестр лицензий":
             notes.append("Адрес из реестра лицензий; актуальность адреса не подтверждена")
         elif candidate["source"] != "DaData":
             notes.append(
@@ -366,6 +368,8 @@ def _manual_review_rows(result):
     rows = []
 
     for item in result.get("review", []):
+        if item.get("status") == "ПРОВЕРИТЬ":
+            continue
         rows.append({
             "kind": "Сопоставление",
             "source_name": item.get("source_name", ""),
@@ -386,7 +390,16 @@ def _manual_review_rows(result):
             "record_ids": item.get("record_ids", ""),
         })
 
+    for record in result.get('records', []):
+        if record.get('selection') == 'ПРОВЕРИТЬ_ОТБОР':
+            rows.append({'kind': 'Отбор входной строки', 'source_name': record.get('name', ''),
+                         'region': record.get('region', ''), 'city': record.get('city', ''),
+                         'status': 'ВРУЧНАЯ', 'reason': record.get('selection_reason', ''),
+                         'group_id': '', 'record_ids': record['record_id']})
+
     for item in result.get("letters_review", []):
+        if item.get('match_status') not in {'АВТО', 'ПРОВЕРЕНО'}:
+            continue
         rows.append({
             "kind": "Данные письма",
             "source_name": item.get("official_name", ""),
@@ -442,6 +455,15 @@ def _extend_task6_summary(result, source_fill):
     selection_statuses = Counter(
         row.get("selection", "НЕИЗВЕСТНО") for row in result.get("records", [])
     )
+    status_rows = Counter()
+    for group in groups:
+        status_rows[group['status']] += len(group['record_ids'])
+    summary.update({f'Поступивших — {status}': count for status, count in status_rows.items()})
+    total = len(result.get('records', []))
+    summary['Доля АВТО и ПРОВЕРИТЬ, %'] = round(100 * (status_rows['АВТО'] + status_rows['ПРОВЕРИТЬ']) / total, 2) if total else 0
+    summary['Строк писем без индекса (все с флагом НЕТ_ИНДЕКСА)'] = sum(
+        not row.get('postal_code') for row in result.get('letters_ready', []) + result.get('letters_review', [])
+        if row.get('match_status') in {'АВТО', 'ПРОВЕРИТЬ', 'ПРОВЕРЕНО'})
     source_stats = result.get("sources", [])
     duplicate_count = sum(int(row.get("duplicates_removed", 0) or 0) for row in source_stats)
     field_labels = {
@@ -454,7 +476,7 @@ def _extend_task6_summary(result, source_fill):
     summary["Дубли удалены до обработки"] = duplicate_count
     summary["Исключено по правилам отбора"] = result.get("summary", {}).get("excluded_rows", 0)
     summary["Строк требуют уточнения отбора"] = result.get("summary", {}).get("selection_review_rows", 0)
-    summary["Групп на ручную проверку сопоставления"] = len(result.get("review", []))
+    summary["Групп на ручную проверку сопоставления"] = sum(g.get("status") != "ПРОВЕРИТЬ" for g in result.get("review", []))
     summary["Строк исходных книг для заполнения"] = source_fill.get("source_rows", 0)
     summary["Создано копий исходных книг"] = source_fill.get("copy_count", 0)
 
@@ -553,7 +575,10 @@ def save(result, output, overrides=None):
         ],
     )
 
-    all_letters = result["letters_ready"] + result["letters_review"]
+    all_letters = [row for row in result['letters_ready'] + result['letters_review']
+                   if row.get('match_status') in {'АВТО', 'ПРОВЕРИТЬ', 'ПРОВЕРЕНО'}]
+    for number, row in enumerate(all_letters, 1):
+        row['letter_number'] = number
     add_table(
         book,
         "Письма",
@@ -849,13 +874,11 @@ def main(argv=None):
     parser.add_argument('--sheet', help='Название рабочего листа во всех входных книгах')
     parser.add_argument('--list-sheets', action='store_true', help='Показать листы и завершить без обработки')
     parser.add_argument('--check-dadata', '--online', dest='check_dadata', action='store_true',
-                        help='Отдельно сверить результат в DaData; не менять выбранные ИНН')
-    parser.add_argument("--ask-token", action="store_true")
+                        help='Совместимый флаг: требовать ключ DaData; с настроенным ключом каскад работает автоматически')
+    parser.add_argument("--ask-token", action="store_true", help="Запросить API-ключ DaData без отображения ввода")
 
     args = parser.parse_args(argv)
 
-    if args.ask_token and not args.check_dadata:
-        parser.error('--ask-token используется только с --check-dadata')
     if args.list_sheets:
         try:
             for path in args.inputs:
@@ -876,15 +899,13 @@ def main(argv=None):
 
     try:
         config = json.loads(args.config.read_text(encoding='utf-8'))
-        records, sources = read_records(args.inputs, sheet_name=args.sheet)
+        records, sources = read_records(args.inputs, sheet_name=args.sheet, config=config)
         result = process(records, config)
         result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
-        client = None
-        if args.check_dadata:
-            token = getpass.getpass('API-ключ DaData: ') if args.ask_token else os.environ.get('DADATA_API_KEY', '')
-            if not token.strip():
-                parser.error('Для --check-dadata нужен DADATA_API_KEY или --ask-token')
-            client = DaDataClient(token.strip())
+        token = getpass.getpass('API-ключ DaData: ') if args.ask_token else os.environ.get('DADATA_API_KEY', '')
+        if args.check_dadata and not token.strip():
+            parser.error('Для --check-dadata нужен DADATA_API_KEY или --ask-token')
+        client = DaDataClient(token.strip()) if token.strip() else None
 
         def progress(done, total):
             print(f'Обработано групп: {done}/{total}', file=sys.stderr, flush=True)

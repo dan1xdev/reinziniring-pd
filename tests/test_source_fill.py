@@ -1,9 +1,11 @@
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.formula import ArrayFormula
 
 from ou_processor.input import read_records
 from ou_processor.letters import prepare_letters
@@ -130,7 +132,10 @@ class SourceFillTests(unittest.TestCase):
             book.create_sheet("Архив")["A1"] = "Сохранить"
             book.save(source)
 
+            with ZipFile(source) as archive:
+                original_parts = {name: archive.read(name) for name in archive.namelist()}
             result, record, candidate = self.make_result_from_minimal(source)
+            result["letters_ready"][0]["official_name"] = '=Название & "филиал" <1>\nВторая строка'
             stats = fill_source_copies(result, output)
             copy_path = output / "filled_sources" / stats["copies"][0]["file"]
             copied = load_workbook(copy_path)
@@ -140,7 +145,17 @@ class SourceFillTests(unittest.TestCase):
             self.assertIn("Адрес", headers)
             self.assertIn("Индекс", headers)
             self.assertEqual(copied["Архив"]["A1"].value, "Сохранить")
+            self.assertEqual(copied["Данные"]["E2"].value, '=Название & "филиал" <1>\nВторая строка')
+            self.assertEqual(copied["Данные"]["E2"].data_type, "s")
+            self.assertEqual(copied["Данные"]["D2"].value, "00123")
+            self.assertEqual(copied["Данные"]["D2"].number_format, "@")
+            self.assertEqual(copied["Данные"].calculate_dimension(), "A1:H2")
             copied.close()
+            with ZipFile(copy_path) as archive:
+                for name, content in original_parts.items():
+                    if name != "xl/worksheets/sheet1.xml":
+                        self.assertEqual(archive.read(name), content, name)
+                self.assertIn(b'ref="A1:H2"', archive.read("xl/worksheets/sheet1.xml"))
 
     def test_exact_duplicate_source_row_is_also_filled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +181,36 @@ class SourceFillTests(unittest.TestCase):
             self.assertEqual(copied["Данные"]["E2"].value, candidate["candidate_name"])
             self.assertEqual(copied["Данные"]["E3"].value, candidate["candidate_name"])
             copied.close()
+
+    def test_unconfirmed_letter_with_same_inn_cannot_replace_confirmed_values(self):
+        for confirmed_status in ("АВТО", "ПРОВЕРЕНО", None):
+            for proposal_status in ("ПРОВЕРИТЬ", "ВРУЧНАЯ"):
+                with self.subTest(confirmed=confirmed_status, proposal=proposal_status):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        source = Path(tmp) / "source.xlsx"
+                        self.make_input(source)
+                        result, _, candidate = self.make_result(source)
+                        confirmed = {**(result["letters_ready"] + result["letters_review"])[0]}
+                        if confirmed_status is None:
+                            confirmed.pop("match_status", None)
+                        else:
+                            confirmed["match_status"] = confirmed_status
+                        result["letters_ready"] = [confirmed]
+                        result["letters_review"] = [{
+                            **confirmed,
+                            "match_status": proposal_status,
+                            "official_name": "Неподтверждённое учреждение",
+                            "address": "Неподтверждённый адрес",
+                        }]
+
+                        stats = fill_source_copies(result, Path(tmp) / "out")
+
+                        copied = load_workbook(
+                            Path(tmp) / "out" / "filled_sources" / stats["copies"][0]["file"]
+                        )
+                        self.assertEqual(copied["Данные"]["E2"].value, candidate["candidate_name"])
+                        self.assertEqual(copied["Данные"]["G2"].value, "Москва, улица Арбат, дом 1")
+                        copied.close()
 
     def test_conflicting_postal_codes_are_not_written(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,20 +267,54 @@ class SourceFillTests(unittest.TestCase):
             self.assertEqual(copied["Данные"]["G2"].value, "Москва, Тверская улица, дом 1")
             copied.close()
 
-    def test_formula_in_other_sheet_blocks_copy_instead_of_losing_cached_value(self):
+    def test_array_formula_result_cells_are_preserved_with_the_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source.xlsx"
+            self.make_input(source)
+            result, _, candidate = self.make_result(source)
+            original = load_workbook(source)
+            original["Данные"]["G2"] = ArrayFormula(ref="G2:H2", text="=TRANSPOSE({1;101000})")
+            original["Данные"]["H2"] = 101000
+            original.save(source)
+            original.close()
+            with ZipFile(source) as archive:
+                before = archive.read("xl/worksheets/sheet1.xml")
+            original_cells = [
+                re.search(rb'<c\b[^>]*r="' + coordinate + rb'"[^>]*>.*?</c>', before).group()
+                for coordinate in (b"G2", b"H2")
+            ]
+
+            stats = fill_source_copies(result, Path(tmp) / "out")
+
+            destination = Path(tmp) / "out" / "filled_sources" / stats["copies"][0]["file"]
+            copied = load_workbook(destination, data_only=True)
+            self.assertEqual(copied["Данные"]["H2"].value, 101000)
+            self.assertEqual(copied["Данные"]["E2"].value, candidate["candidate_name"])
+            copied.close()
+            self.assertEqual(stats["written"].get("postal_code", 0), 0)
+            with ZipFile(destination) as archive:
+                after = archive.read("xl/worksheets/sheet1.xml")
+            for original_cell in original_cells:
+                self.assertIn(original_cell, after)
+
+    def test_fills_formula_book_preserving_all_other_parts_and_cached_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "source.xlsx"
             self.make_input(source)
             original = load_workbook(source)
             original["Другой лист"]["C3"] = "=1+1"
+            original["Данные"]["I2"] = "=1+1"
+            original["Данные"]["H2"] = "=100000+19019"
             original.save(source)
             original.close()
             with ZipFile(source) as archive:
                 parts = {name: archive.read(name) for name in archive.namelist()}
-            sheet_xml = parts["xl/worksheets/sheet2.xml"]
-            parts["xl/worksheets/sheet2.xml"] = sheet_xml.replace(b"<v></v>", b"<v>2</v>").replace(
-                b"<v />", b"<v>2</v>"
-            )
+            for name in ("xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml"):
+                parts[name] = re.sub(br"<f>1\+1</f><v(?:></v>|\s*/>)", b"<f>1+1</f><v>2</v>", parts[name])
+                parts[name] = re.sub(
+                    br"<f>100000\+19019</f><v(?:></v>|\s*/>)",
+                    b"<f>100000+19019</f><v>119019</v>", parts[name]
+                )
             with ZipFile(source, "w", ZIP_DEFLATED) as archive:
                 for name, content in parts.items():
                     archive.writestr(name, content)
@@ -243,9 +322,25 @@ class SourceFillTests(unittest.TestCase):
             self.assertEqual(original["Другой лист"]["C3"].value, 2)
             original.close()
 
+            before = source.read_bytes()
             stats = fill_source_copies(self.make_result(source)[0], Path(tmp) / "out")
-            self.assertEqual(stats["copy_count"], 0)
-            self.assertTrue(any("формул" in error.lower() for error in stats["errors"]))
+            self.assertEqual(stats["copy_count"], 1)
+            self.assertEqual(stats["errors"], [])
+            self.assertEqual(source.read_bytes(), before)
+            destination = Path(tmp) / "out" / "filled_sources" / stats["copies"][0]["file"]
+            with ZipFile(destination) as archive:
+                self.assertEqual(set(archive.namelist()), set(parts))
+                for name, content in parts.items():
+                    if name != "xl/worksheets/sheet1.xml":
+                        self.assertEqual(archive.read(name), content, name)
+                selected_xml = archive.read("xl/worksheets/sheet1.xml")
+                self.assertIn(b"<f>1+1</f><v>2</v>", selected_xml)
+                self.assertIn(b"<f>100000+19019</f><v>119019</v>", selected_xml)
+            copied = load_workbook(destination, data_only=True)
+            self.assertEqual(copied["Данные"]["I2"].value, 2)
+            self.assertEqual(copied["Данные"]["H2"].value, 119019)
+            self.assertTrue(copied["Данные"]["E2"].value)
+            copied.close()
             original = load_workbook(source, data_only=True)
             self.assertEqual(original["Другой лист"]["C3"].value, 2)
             original.close()
