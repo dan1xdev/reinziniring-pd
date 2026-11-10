@@ -247,13 +247,26 @@ class RegistrySearch:
         return result, len(found) > 2000
 
 
-def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None):
+def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, manual_lookup=None):
     by_id = {r['record_id']: r for r in result['records']}
     resolutions, candidates = [], []
     for index, group in enumerate(result['groups'], 1):
         if check_cancel:
             check_cancel()
         record = by_id[group['record_ids'][0]]
+        decision = manual_lookup(record) if manual_lookup else None
+        if decision and isinstance(decision.get('candidate'), dict):
+            selected = dict(decision['candidate'])
+            if str(selected.get('candidate_inn', '')) == str(decision.get('inn', '')):
+                selected['group_id'] = group['group_id']
+                candidates.append(selected)
+                resolutions.append({'group_id':group['group_id'], 'record_ids':group['record_ids'],
+                    'source_name':record['name'], 'selected':selected, 'status':'ПРОВЕРЕНО',
+                    'registry_used':False, 'registry_truncated':False, 'candidate_count':1,
+                    'manual_decision':True, 'manual_comment':decision.get('comment',''),
+                    'manual_reviewed_at':decision.get('reviewed_at','')})
+                if on_progress: on_progress(index, len(result['groups']))
+                continue
         found = []
         selected = None
         for query in queries(record):

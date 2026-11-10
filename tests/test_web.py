@@ -88,11 +88,12 @@ class UploadTests(unittest.TestCase):
     def test_filename_cannot_escape_upload_directory(self):
         self.assertEqual(unpack_uploads([upload('../../test.xlsx')])[0][0],'test.xlsx')
 
-    def test_missing_key_is_reported(self):
+    def test_default_processing_does_not_require_dadata_key(self):
         with tempfile.TemporaryDirectory() as root:
             app=Application(root,root,Path(root)/'cache.json')
-            with self.assertRaisesRegex(UserError,'API-ключ'):
-                app.start({'files':[upload()]})
+            with patch.object(app, 'run'):
+                job_id = app.start({'files':[upload()]})
+            self.assertEqual(app.snapshot(job_id)['status'], 'running')
 
     def test_job_failure_releases_worker(self):
         with tempfile.TemporaryDirectory() as root:

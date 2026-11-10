@@ -36,13 +36,16 @@ def aggregate(result):
                 top.setdefault(option['candidate_inn'], option)
             top = list(top.values())[:3]
             reasons = sorted({reason for option in top for reason in option['reasons']})
-            review.append({**resolution, 'region': members[0]['region'], 'city': members[0]['city'],
+            review.append({**resolution, 'name': members[0].get('name', ''), 'region': members[0]['region'], 'city': members[0]['city'],
                 'students': '\n'.join(dict.fromkeys(r.get('student_name', '') for r in members if r.get('student_name', ''))),
                 'files': '\n'.join(dict.fromkeys(r['personal_file_number'] for r in members if r['personal_file_number'])),
                 'reason': '\n'.join(reasons) or ('Несколько подходящих ИНН' if options else 'Кандидаты не найдены'),
                 'top_candidates': '\n\n'.join(f"{c['candidate_inn']} | {c['candidate_name']} | {c['address']} | {c['source']}" for c in top),
+                'candidates': [{k: c.get(k, '') for k in ('candidate_inn','candidate_name','address','score','reasons','source','region','city')}
+                               for c in top],
                 'record_ids': '\n'.join(resolution['record_ids'])})
         for r in members:
+            r['manual_comment'] = resolution.get('manual_comment', '')
             r['resolved_inn'] = selected['candidate_inn'] if selected else ''
             r['resolution_status'] = resolution['status']
             r['resolution_source'] = selected['source'] if selected else ''
@@ -85,7 +88,7 @@ def aggregate(result):
             'files': '\n'.join(p['file'] or 'Номер отсутствует' for p in people),
             'student_count': len(people), 'inn': inn, 'ogrn': candidate['candidate_ogrn'],
             'postal_code': candidate['postal_code'], 'region': candidate['region'],
-            'source': candidate['source'], 'status': 'Сопоставлено автоматически',
+            'source': candidate['source'], 'status': 'ПРОВЕРЕНО' if any(g.get('manual_decision') for g, _ in groups) else 'Сопоставлено автоматически',
             'notes': '\n'.join(notes), 'aliases': '\n'.join(sorted({r['name'] for r in members})),
             'row_count': len(members), 'record_ids': '\n'.join(r['record_id'] for r in members)})
     schools.sort(key=lambda r: (not bool(r['student_count']), r['school_name'].casefold()))
@@ -95,6 +98,7 @@ def aggregate(result):
         'Входных строк': len(result['records']), 'Отобрано строк': result['summary']['selected_rows'],
         'Сопоставлено исходных строк': sum(r['row_count'] for r in schools),
         'Исходных строк на проверку': sum(len(g['record_ids']) for g in groups if not g['selected']),
+        'Групп подтверждено оператором': sum(bool(g.get('manual_decision')) for g in groups),
         'Учреждений без повторов по ИНН': len(schools),
         'Учреждений с адресом': sum(bool(r['address']) for r in schools),
         'Учреждений с данными учеников': sum(bool(r['student_count']) for r in schools),
@@ -142,7 +146,7 @@ def save(result, output):
         {'metric':'Резервный реестр','value':'https://isga.obrnadzor.gov.ru/accredreestr/opendata/'}]
     add_table(book,'Сводка',summary,[('metric','Показатель'),('value','Значение')])
     add_table(book,'Исходные записи',result['records'],[('resolved_inn','Сопоставленный ИНН'),
-        ('resolution_status','Результат сопоставления'),('resolution_source','Источник сопоставления'),*RECORD_COLUMNS])
+        ('resolution_status','Результат сопоставления'),('resolution_source','Источник сопоставления'),('manual_comment','Комментарий оператора'),*RECORD_COLUMNS])
     add_table(book,'Запросы DaData',result['resolution']['requests'],[('group_id','Группа'),('query','Запрос'),
         ('status','Статус'),('candidate_count','Кандидатов'),('cached','Из кэша'),('timestamp_utc','Время UTC')])
     # В книге достаточно первых пяти различных ИНН на группу; полный аудит есть в JSON.
@@ -160,6 +164,7 @@ def save(result, output):
         ('candidate_name','Название'),('candidate_inn','ИНН'),('address','Адрес'),('legal_status','Статус источника'),
         ('eligible','Прошёл правила'),('score','Совпадение слов, %'),('reasons','Причины отказа'),
         ('source_url','Источник в интернете'),('certificate_id','ID записи реестра')])
+    add_table(book,'Ручные проверки DaData',result.get('manual_dadata_checks', []), [('group_id','Группа'),('checked_at','Время UTC'),('inns','ИНН DaData'),('discrepancies','Расхождения')])
     add_table(book,'Источники',result['sources'],[('file','Файл'),('rows','Строк'),('sha256','SHA-256'),('source_id','Код источника')])
     book.save(output / 'schools.xlsx')
 

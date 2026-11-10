@@ -143,8 +143,117 @@ $('forget-token').onclick = async () => {
     $('token').value = ''; await refreshRegistry();
   } catch (error) { showError(error.message); }
 };
+async function saveDecision(groupId, inn, comment, button, card) {
+  button.disabled = true;
+  try {
+    const result = await request('/api/jobs/' + currentJob + '/decisions', {
+      method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf},
+      body:JSON.stringify({group_id:groupId, inn, comment})
+    });
+    card.querySelector('.decision-status').textContent = 'Сохранено: ' + result.status + ' (ИНН ' + result.inn + ')';
+    card.querySelectorAll('select,textarea,button').forEach(el => { if (el !== button) el.disabled = true; });
+    button.textContent = 'Решение сохранено';
+  } catch (error) { showError(error.message); button.disabled = false; }
+}
+function renderManualReview(items, selectionItems=[]) {
+  const section = $('manual-review'), list = $('review-list');
+  list.replaceChildren();
+  const pending = (items || []).filter(item => item.status !== 'ПРОВЕРЕНО');
+  section.hidden = false; // Очередь видна даже при недоступном реестре и пустом поиске.
+  if (!pending.length && !selectionItems.length) {
+    const note=document.createElement('p'); note.className='muted';
+    note.textContent='Нет записей для ручной проверки в этом запуске.'; list.append(note);
+  }
+  selectionItems.forEach(item => {
+    const card=document.createElement('article'); card.className='review-card';
+    const heading=document.createElement('h4'); heading.textContent=item.name || 'Без названия'; card.append(heading);
+    const explanation=document.createElement('p'); explanation.textContent='Проверка исходных данных: '+(item.reason || 'Недостаточно данных')+'. Вид образования: '+(item.education || 'не определён')+'. Уточните вид образования в исходном Excel и повторите обработку. Выбор ИНН недоступен до отбора записи.'; card.append(explanation);
+    list.append(card);
+  });
+  pending.forEach(item => {
+    const card = document.createElement('article'); card.className = 'review-card';
+    const title = document.createElement('h4'); title.textContent = item.name || 'Учреждение без названия'; card.append(title);
+    const meta = document.createElement('p'); meta.className = 'muted'; meta.textContent = [item.region,item.city].filter(Boolean).join(' · '); card.append(meta);
+    const reason = document.createElement('p'); reason.textContent = 'Причина проверки: ' + (item.reason || 'Требуется ручное решение'); card.append(reason);
+    const select = document.createElement('select'); select.setAttribute('aria-label','Кандидат для подтверждения');
+    const placeholder = document.createElement('option'); placeholder.value=''; placeholder.textContent='Выберите кандидата'; select.append(placeholder);
+    (item.candidates || []).slice(0,3).forEach(c => {
+      const option = document.createElement('option'); option.value=String(c.candidate_inn || '');
+      option.textContent = `${c.candidate_name || 'Без названия'} — ИНН ${c.candidate_inn || 'нет'} — ${c.address || 'адрес не указан'} — балл ${c.score ?? 'н/д'} — источник ${c.source || 'не указан'} — ${(c.reasons || []).join(', ') || 'требует подтверждения'}`;
+      select.append(option);
+    });
+    card.append(select);
+    if (!(item.candidates || []).length) {
+      const note=document.createElement('p'); note.className='muted';
+      note.textContent='Кандидатов пока нет: локальный реестр недоступен или поиск не дал результатов. Дождитесь загрузки реестра и повторите обработку либо нажмите «Проверить в DaData». Без подтверждённого кандидата ИНН выбрать нельзя.';
+      card.append(note); select.disabled=true;
+    }
+    const dadata = document.createElement('button'); dadata.type='button'; dadata.className='secondary'; dadata.textContent='Проверить в DaData';
+    dadata.onclick = async () => {
+      const token = prompt('Введите API-ключ DaData. Запрос отправит название и географию учреждения, но не ФИО и номера личных дел.');
+      if (!token) return;
+      dadata.disabled = true;
+      try {
+        const result = await request('/api/jobs/' + currentJob + '/dadata', {method:'POST',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf},
+          body:JSON.stringify({group_id:item.group_id, token})});
+        renderManualReview(result.review || []);
+        if (result.discrepancies?.length) showError(result.discrepancies.join(' '));
+        if (!result.count) showError('DaData не нашла кандидатов для этой записи.');
+      } catch (error) { showError(error.message); dadata.disabled = false; }
+    };
+    card.append(dadata);
+    const comment = document.createElement('textarea'); comment.maxLength=1000; comment.placeholder='Комментарий (необязательно)'; comment.setAttribute('aria-label','Комментарий к решению'); card.append(comment);
+    const save = document.createElement('button'); save.type='button'; save.className='secondary'; save.textContent='Подтвердить ИНН';
+    const status = document.createElement('p'); status.className='decision-status muted';
+    save.onclick = () => { if (!select.value) return showError('Выберите ИНН из списка кандидатов.'); saveDecision(item.group_id, select.value, comment.value, save, card); };
+    if (!(item.candidates || []).length) save.disabled=true;
+    card.append(save,status); list.append(card);
+  });
+}
+$('decision-template').addEventListener('click', async event => {
+  event.preventDefault();
+  if (!currentJob) return showError('Сначала обработайте Excel.');
+  const link = $('decision-template');
+  link.style.pointerEvents = 'none';
+  try {
+    const response = await fetch('/api/jobs/' + currentJob + '/decisions-template', {cache:'no-store'});
+    if (!response.ok) {
+      let message = 'Не удалось скачать файл решений (HTTP ' + response.status + ').';
+      try { const error = await response.json(); message = error.error || message; } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'manual_decisions.xlsx';
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (error) { showError(error.message); }
+  finally { link.style.pointerEvents = ''; }
+});
+$('decision-file').onchange = async event => {
+  const file = event.target.files[0];
+  if (!file || !currentJob) return;
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (bytes.length > 5_500_000) throw Error('Файл решений слишком большой.');
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.slice(i,i+8192));
+    const data = btoa(binary);
+    const response = await request('/api/jobs/' + currentJob + '/decisions-import', {
+      method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf},
+      body:JSON.stringify({data})
+    });
+    $('decision-import-status').textContent = `Импортировано решений: ${response.imported}. Excel обновлён.`;
+    renderManualReview(response.review || []);
+  } catch (error) { showError(error.message); }
+  finally { event.target.value = ''; }
+};
 function renderResult(job) {
-  $('result').hidden = false; $('download').href = job.download;
+  $('result').hidden = false;
+  renderManualReview(job.review || [], job.selection_review || []); $('download').href = job.download;
+  $('decision-template').href = '/api/jobs/' + currentJob + '/decisions-template';
   $('result-title').textContent = job.partial ? 'Таблица готова, есть ошибки поиска' : 'Таблица готова';
   $('metrics').replaceChildren();
   for (const [value, label] of [[job.summary.rows,'строк обработано'],[job.summary.schools,'учреждений объединено'],[job.summary.students,'пар ФИО и номер дела'],[job.summary.review,'строк требуют проверки']]) {
@@ -172,7 +281,7 @@ async function init() {
     updateTokenNote(); renderRegistry();
     updateButton();
     currentJob = sessionStorage.getItem('schools-job');
-    if (currentJob) { const previous = await request('/api/jobs/' + currentJob).catch(() => null); if (previous) { setBusy(['running','cancelling'].includes(previous.status)); poll(); } else sessionStorage.removeItem('schools-job'); }
+    if (currentJob) { const previous = await request('/api/jobs/' + currentJob).catch(() => null); if (previous && previous.status !== 'error') { setBusy(['running','cancelling'].includes(previous.status)); poll(); } else { sessionStorage.removeItem('schools-job'); currentJob = null; if (previous?.error) showError(previous.error); } }
   } catch (error) { showError('Сервер недоступен. Запустите приложение по инструкции и обновите страницу.'); }
 }
 init();

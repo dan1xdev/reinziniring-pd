@@ -46,3 +46,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Разрешаем только синтетический тестовый fixture
+!tests/fixtures/test_schools.xlsx

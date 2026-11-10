@@ -10,17 +10,38 @@ from .normalization import ABBREVIATIONS, abbreviation_flags, expanded_key, inst
 
 
 def education_kind(record, config):
+    """Determine education level using configured labels and document evidence.
+
+    Common verbose forms are accepted without overriding contradictory documents.
+    Unknown explicit labels are not trusted: a recognized document can still
+    identify the level, but a conflicting recognized level requires review.
+    """
     explicit = normalize(record.get("education"))
     document = normalize(record.get("document"))
     aliases = {normalize(alias): kind for kind, values in config["education"].items()
                for alias in [kind, *values]}
-    document_kind = next((kind for fragment, kind in config["documents"].items()
-                          if normalize(fragment) in document), "")
-    if explicit:
-        kind = aliases.get(explicit, "НЕИЗВЕСТНО")
-        conflict = bool(document_kind and document_kind != kind)
-        return kind, "Вид образования", conflict
-    return document_kind or "НЕИЗВЕСТНО", "Тип документа об образовании" if document_kind else "нет данных", False
+    doc_kind = next((kind for fragment, kind in config["documents"].items()
+                     if normalize(fragment) in document), "") if document else ""
+    kind = aliases.get(explicit, "")
+    if not kind and explicit:
+        # Only unambiguous, known wordings are accepted; no guesses based on
+        # citizenship, admission level or organization name.
+        conventional = {
+            "среднее общее образование": "Среднее общее",
+            "среднее полное общее образование": "Среднее общее",
+            "основное общее образование": "Основное общее",
+            "среднее профессиональное образование": "Среднее профессиональное",
+            "начальное профессиональное образование": "Начальное профессиональное",
+            "высшее образование": "Высшее",
+        }
+        kind = conventional.get(explicit, "")
+    if kind and doc_kind and kind != doc_kind:
+        return kind, "Вид образования / документ (конфликт)", True
+    if kind:
+        return kind, "Вид образования", False
+    if doc_kind:
+        return doc_kind, "Тип документа об образовании", False
+    return "НЕИЗВЕСТНО", "нет распознанных данных", False
 
 
 def process(records, config):
