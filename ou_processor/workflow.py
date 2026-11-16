@@ -10,7 +10,7 @@ from .resolution import LicenseSearch, RegistrySearch, SearchCache, resolve
 
 
 def search(result, registry_path, config, *, licenses_path=None, cache=None, client=None,
-           on_progress=None, check_cancel=None):
+           on_progress=None, check_cancel=None, manual_decisions=None):
     registry = None
     licenses = None
     warnings = []
@@ -31,20 +31,20 @@ def search(result, registry_path, config, *, licenses_path=None, cache=None, cli
         except (ValueError, OSError, KeyError, sqlite3.Error):
             warnings.append('Локальный реестр недоступен (резервный реестр аккредитации). Основной поиск по лицензиям продолжается; автоматического обращения к DaData нет.')
         try:
-            resolve(result, None, registry, progress=False, config=config, licenses=licenses,
+            resolve(result, None, registry, progress=False, config=config, licenses=licenses, manual_decisions=manual_decisions,
                     on_progress=report(0), check_cancel=check_cancel)
         except sqlite3.Error:
             try:
-                resolve(result, None, None, progress=False, config=config, licenses=licenses,
+                resolve(result, None, None, progress=False, config=config, licenses=licenses, manual_decisions=manual_decisions,
                         on_progress=report(0), check_cancel=check_cancel)
             except sqlite3.Error:
                 warnings.append('Не удалось прочитать индекс реестра лицензий. Проверяем резервный реестр аккредитации.')
                 try:
-                    resolve(result, None, registry, progress=False, config=config,
+                    resolve(result, None, registry, progress=False, config=config, manual_decisions=manual_decisions,
                             on_progress=report(0), check_cancel=check_cancel)
                 except sqlite3.Error:
                     warnings.append('Не удалось прочитать индекс резервного реестра. Учреждения переданы на проверку; обновите локальные реестры.')
-                    resolve(result, None, None, progress=False, config=config,
+                    resolve(result, None, None, progress=False, config=config, manual_decisions=manual_decisions,
                             on_progress=report(0), check_cancel=check_cancel)
             else:
                 warnings.append('Не удалось прочитать индекс резервного реестра. Сопоставления по лицензиям сохранены.')
@@ -98,6 +98,9 @@ def write_log(result, destination):
             'license_truncated': group.get('license_truncated', False),
             'registry_used': group['registry_used'],
             'registry_truncated': group.get('registry_truncated', False),
+            'manual_decision': group.get('manual_decision', False),
+            'manual_comment': group.get('manual_comment', ''),
+            'manual_reviewed_at': group.get('manual_reviewed_at', ''),
             'candidates': [{k: c.get(k) for k in ('candidate_inn', 'source', 'source_url', 'score', 'eligible', 'reasons')}
                            for c in candidates.get(group['group_id'], [])],
         })

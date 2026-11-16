@@ -21,6 +21,7 @@ from .dadata import DaDataClient
 from .key_storage import TokenStore
 from .full_run import aggregate, save
 from .input import list_sheets, read_records
+from .manual_review import MAX_DECISION_BYTES, apply_import, load_result, load_store, save_store
 from .license_registry import auto_update as license_auto_update
 from .license_registry import current_snapshot as current_license_snapshot
 from .pipeline import process
@@ -76,8 +77,9 @@ def unpack_uploads(files, deduplicate=True):
 
 class Application:
     def __init__(self, storage, registry, cache, token='', client_factory=DaDataClient,
-                 token_store=None, registry_worker=None, licenses=None, licenses_worker=None):
+                 token_store=None, registry_worker=None, licenses=None, licenses_worker=None, decisions_store=None):
         self.storage, self.registry, self.cache = Path(storage), Path(registry), Path(cache)
+        self.decisions_store = Path(decisions_store) if decisions_store else self.storage.parent / 'manual_decisions.json'
         self.licenses = Path(licenses) if licenses else ROOT.parent / 'license_registry_cache'
         self.initial_token = token
         self.token, self.client_factory = token, client_factory
@@ -230,6 +232,64 @@ class Application:
                 raise JobCancelled()
             self.jobs[job_id].update(status='done', phase='Готово', progress=100, **fields)
 
+    def publish(self, job_id, result):
+        summary = result['full_summary']
+        errors = [r['status'] for r in result['resolution']['requests'] if r['status'] != 'OK']
+        warnings = list(result.get('warnings', []))
+        source_fill = result.get('source_fill', {})
+        if source_fill.get('copy_count'):
+            warnings.append(f"Созданы заполненные копии исходных книг: {source_fill['copy_count']}. Оригиналы не изменены.")
+        if source_fill.get('errors'):
+            warnings.append('Не все копии исходных книг удалось заполнить: ' + '; '.join(source_fill['errors']))
+        missing = summary['Строк без данных ученика']
+        if missing:
+            warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
+        self.finish(job_id,
+            summary={'rows': summary['Входных строк'], 'schools': len(result['schools']),
+                     'students': len(result['students']),
+                     'review': summary['Исходных строк на проверку'] + result['summary']['selection_review_rows'],
+                     'addresses': summary['Учреждений с адресом'], 'excluded': result['summary']['excluded_rows'],
+                     'verified': sum(bool(g.get('manual_decision')) for g in result['resolution']['groups'])},
+            warnings=warnings, partial=bool(errors or source_fill.get('errors')), preview=result['schools'][:20],
+            download=f'/api/jobs/{job_id}/download', journal=f'/api/jobs/{job_id}/journal',
+            manual_template=f'/api/jobs/{job_id}/manual-template', manual_pending=len(result.get('review', [])),
+            filled_sources=[{'source': item['source'], 'file': item['file'],
+                             'url': f'/api/jobs/{job_id}/filled-sources/{index}'}
+                            for index, item in enumerate(source_fill.get('copies', []))])
+
+    def import_decisions(self, job_id, payload):
+        if not isinstance(payload, dict) or not isinstance(payload.get('data'), str):
+            raise UserError('Выберите заполненный шаблон решений .xlsx.')
+        if len(payload['data']) > (MAX_DECISION_BYTES * 4 // 3 + 4):
+            raise UserError('Файл решений не должен превышать 6 МБ.')
+        try:
+            content = base64.b64decode(payload['data'], validate=True)
+        except (ValueError, binascii.Error):
+            raise UserError('Файл решений повреждён при загрузке.') from None
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job or job['status'] != 'done':
+                raise UserError('Сначала дождитесь завершения обработки на текущем сервере.')
+            if self.active:
+                raise UserError('Уже идёт обработка. Дождитесь её завершения.')
+            self.active = job_id
+        try:
+            folder = self.storage / job_id / 'result'
+            result = load_result(folder / 'result.json')
+            updated, decisions = apply_import(result, content, load_store(self.decisions_store))
+            aggregate(updated)
+            save(updated, folder)
+            save_store(self.decisions_store, decisions)
+            self.publish(job_id, updated)
+            return {'imported': updated['manual_import']['imported'], 'job': self.snapshot(job_id)}
+        except (OSError, ValueError, KeyError) as error:
+            if isinstance(error, ValueError) and not isinstance(error, json.JSONDecodeError):
+                raise UserError(str(error)) from None
+            raise UserError('Не удалось сохранить решения. Проверьте файлы результата и доступ к папке справочника.') from None
+        finally:
+            with self.lock:
+                self.active = None
+
     def run(self, job_id, uploaded, token='', mode='registry', sheets=None):
         was_cancelled = False
         directory = self.storage / job_id
@@ -257,7 +317,7 @@ class Application:
             self.change(job_id, phase=phase, progress=8, total=len(result['groups']))
             client = self.client_factory(token) if mode == 'dadata_check' else None
             search(result, self.registry, config, licenses_path=self.licenses,
-                cache=self.cache, client=client,
+                cache=self.cache, client=client, manual_decisions=load_store(self.decisions_store),
                 on_progress=lambda done, total: self.progress(job_id, done, total),
                 check_cancel=lambda: self.check_cancel(job_id))
             self.check_cancel(job_id)
@@ -266,37 +326,7 @@ class Application:
             self.check_cancel(job_id)
             save(result, directory / 'result')
             self.check_cancel(job_id)
-            summary = result['full_summary']
-            errors = [r['status'] for r in result['resolution']['requests'] if r['status'] != 'OK']
-            issues = summary['Исходных строк на проверку'] + result['summary']['selection_review_rows']
-            warnings = list(result['warnings'])
-            source_fill = result.get('source_fill', {})
-            if source_fill.get('copy_count'):
-                warnings.append(
-                    f"Созданы заполненные копии исходных книг: {source_fill['copy_count']}. "
-                    f"Они сохранены в ui_runs/{job_id}/result/filled_sources; оригиналы не изменены."
-                )
-            if source_fill.get('errors'):
-                warnings.append(
-                    'Не все копии исходных книг удалось заполнить: '
-                    + '; '.join(source_fill['errors'])
-                )
-            missing = summary['Строк без данных ученика']
-            if missing:
-                warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
-            self.finish(job_id,
-                summary={'rows': summary['Входных строк'], 'schools': len(result['schools']),
-                         'students': len(result['students']), 'review': issues,
-                         'addresses': summary['Учреждений с адресом'],
-                         'excluded': result['summary']['excluded_rows']},
-                warnings=warnings, partial=bool(errors or source_fill.get('errors')), preview=result['schools'][:20],
-                download=f'/api/jobs/{job_id}/download',
-                journal=f'/api/jobs/{job_id}/journal',
-                filled_sources=[{
-                    'source': item['source'],
-                    'file': item['file'],
-                    'url': f'/api/jobs/{job_id}/filled-sources/{index}',
-                } for index, item in enumerate(source_fill.get('copies', []))])
+            self.publish(job_id, result)
         except JobCancelled:
             was_cancelled = True
         except (UserError, ValueError) as error:
@@ -378,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, path.read_bytes(),
                 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 attachment=f'filled_source_{index + 1}.xlsx')
-        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download|/journal)?', self.path)
+        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download|/journal|/manual-template)?', self.path)
         if match:
             job = self.app.snapshot(match[1])
             if job:
@@ -389,6 +419,10 @@ class Handler(BaseHTTPRequestHandler):
                 if match[2] == '/journal':
                     path = self.app.storage / match[1] / 'result' / 'processing_log.json'
                     return self.send(200, path.read_bytes(), 'application/octet-stream', attachment='processing_log.json')
+                if match[2] == '/manual-template':
+                    path = self.app.storage / match[1] / 'result' / 'manual_decisions.xlsx'
+                    return self.send(200, path.read_bytes(),
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', attachment='manual_decisions.xlsx')
                 path = self.app.storage / match[1] / 'result' / 'schools.xlsx'
                 return self.send(200, path.read_bytes(),
                     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', attachment=True)
@@ -415,14 +449,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {'token_configured': False, 'token_saved': False})
             except UserError as error:
                 return self.send(400, {'error': str(error)})
-        if self.path not in {'/api/jobs', '/api/sheets'}:
+        import_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/decisions-import', self.path)
+        if self.path not in {'/api/jobs', '/api/sheets'} and not import_match:
             return self.send(404, {'error': 'Не найдено.'})
         try:
             size = int(self.headers.get('Content-Length', '0'))
-            if not 0 < size <= MAX_BODY:
+            limit = MAX_DECISION_BYTES * 4 // 3 + 4096 if import_match else MAX_BODY
+            if not 0 < size <= limit:
+                if import_match:
+                    raise UserError('Файл решений не должен превышать 6 МБ.')
                 raise UserError('Суммарный размер файлов не должен превышать 100 МБ.')
             self.connection.settimeout(60)
             payload = json.loads(self.rfile.read(size))
+            if import_match:
+                return self.send(200, self.app.import_decisions(import_match[1], payload))
             if self.path == '/api/sheets':
                 return self.send(200, self.app.inspect(payload))
             job_id = self.app.start(payload)
@@ -438,6 +478,7 @@ def main():
     parser.add_argument('--registry', type=Path, default=ROOT.parent/'registry_cache')
     parser.add_argument('--licenses', type=Path, default=ROOT.parent/'license_registry_cache')
     parser.add_argument('--cache', type=Path, default=ROOT.parent/'ui_cache'/'dadata.json')
+    parser.add_argument('--decisions-store', type=Path, default=ROOT.parent/'manual_decisions.json')
     parser.add_argument('--ask-token', action='store_true')
     parser.add_argument('--no-browser', action='store_true')
     args = parser.parse_args()
@@ -448,7 +489,7 @@ def main():
             args.cache.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(existing, args.cache)
     app = Application(args.storage, args.registry, args.cache, token,
-                      token_store=TokenStore(), licenses=args.licenses)
+                      token_store=TokenStore(), licenses=args.licenses, decisions_store=args.decisions_store)
     try:
         server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     except OSError:

@@ -24,6 +24,7 @@ from .letters import (
     LETTER_COLUMNS,
 )
 from .input import list_sheets, read_records
+from .manual_review import DEFAULT_STORE, apply_import, load_result, load_store, save_store, template_bytes
 from .normalization import normalize
 from .pipeline import process
 from .source_fill import fill_source_copies
@@ -112,6 +113,8 @@ def aggregate(result):
             })
 
         for record in members:
+            record['manual_comment'] = resolution.get('manual_comment', '')
+            record['manual_reviewed_at'] = resolution.get('manual_reviewed_at', '')
             record["resolved_inn"] = (
                 selected["candidate_inn"]
                 if selected else ""
@@ -267,7 +270,7 @@ def aggregate(result):
             "postal_code": candidate["postal_code"],
             "region": candidate["region"],
             "source": candidate["source"],
-            "status": "Сопоставлено автоматически",
+            "status": 'ПРОВЕРЕНО' if any(g.get('manual_decision') for g, _ in groups) else "Сопоставлено автоматически",
             "notes": "\n".join(notes),
             "aliases": "\n".join(
                 sorted({
@@ -455,6 +458,7 @@ def _extend_task6_summary(result, source_fill):
     summary["Исключено по правилам отбора"] = result.get("summary", {}).get("excluded_rows", 0)
     summary["Строк требуют уточнения отбора"] = result.get("summary", {}).get("selection_review_rows", 0)
     summary["Групп на ручную проверку сопоставления"] = len(result.get("review", []))
+    summary['Групп подтверждено оператором'] = sum(bool(g.get('manual_decision')) for g in groups)
     summary["Строк исходных книг для заполнения"] = source_fill.get("source_rows", 0)
     summary["Создано копий исходных книг"] = source_fill.get("copy_count", 0)
 
@@ -712,6 +716,8 @@ def save(result, output, overrides=None):
             ("resolved_inn", "Сопоставленный ИНН"),
             ("resolution_status", "Результат сопоставления"),
             ("resolution_source", "Источник сопоставления"),
+            ('manual_comment', 'Комментарий оператора'),
+            ('manual_reviewed_at', 'Дата ручного решения UTC'),
             *RECORD_COLUMNS,
         ],
     )
@@ -819,11 +825,17 @@ def save(result, output, overrides=None):
     )
     temporary_json.replace(output / "result.json")
     write_log(result, output)
+    template = output / 'manual_decisions.tmp.xlsx'
+    template.write_bytes(template_bytes(result))
+    template.replace(output / 'manual_decisions.xlsx')
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("inputs", nargs="+", type=Path)
+    parser.add_argument("inputs", nargs="*", type=Path)
+    parser.add_argument('--result', type=Path, help='result.json предыдущего запуска для импорта решений')
+    parser.add_argument('--import-decisions', type=Path, help='Заполненный шаблон manual_decisions.xlsx')
+    parser.add_argument('--decisions-store', type=Path, default=DEFAULT_STORE, help='Локальный справочник подтверждений')
     parser.add_argument(
         "--output",
         type=Path,
@@ -854,6 +866,12 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
+    if args.result or args.import_decisions:
+        if not args.result or not args.import_decisions or args.inputs or args.list_sheets or args.check_dadata or args.ask_token or args.sheet:
+            parser.error('Импорт: --result result.json --import-decisions решения.xlsx --output новая_папка; без входных книг и DaData')
+    elif not args.inputs:
+        parser.error('Укажите входные книги или --result и --import-decisions')
+
     if args.ask_token and not args.check_dadata:
         parser.error('--ask-token используется только с --check-dadata')
     if args.list_sheets:
@@ -875,32 +893,42 @@ def main(argv=None):
         )
 
     try:
-        config = json.loads(args.config.read_text(encoding='utf-8'))
-        records, sources = read_records(args.inputs, sheet_name=args.sheet)
-        result = process(records, config)
-        result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
-        client = None
-        if args.check_dadata:
-            token = getpass.getpass('API-ключ DaData: ') if args.ask_token else os.environ.get('DADATA_API_KEY', '')
-            if not token.strip():
-                parser.error('Для --check-dadata нужен DADATA_API_KEY или --ask-token')
-            client = DaDataClient(token.strip())
+        decisions = load_store(args.decisions_store)
+        if args.result:
+            result = load_result(args.result)
+            result, decisions = apply_import(result, args.import_decisions.read_bytes(), decisions)
+        else:
+            config = json.loads(args.config.read_text(encoding='utf-8'))
+            records, sources = read_records(args.inputs, sheet_name=args.sheet)
+            result = process(records, config)
+            result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
+            client = None
+            if args.check_dadata:
+                token = getpass.getpass('API-ключ DaData: ') if args.ask_token else os.environ.get('DADATA_API_KEY', '')
+                if not token.strip():
+                    parser.error('Для --check-dadata нужен DADATA_API_KEY или --ask-token')
+                client = DaDataClient(token.strip())
 
-        def progress(done, total):
-            print(f'Обработано групп: {done}/{total}', file=sys.stderr, flush=True)
+            def progress(done, total):
+                print(f'Обработано групп: {done}/{total}', file=sys.stderr, flush=True)
 
-        search(result, args.registry, config, licenses_path=args.licenses,
-               cache=args.cache, client=client, on_progress=progress)
+            search(result, args.registry, config, licenses_path=args.licenses,
+                   cache=args.cache, client=client, on_progress=progress, manual_decisions=decisions)
         aggregate(result)
         save(result, args.output)
+        if args.result:
+            save_store(args.decisions_store, decisions)
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, ParseError, InvalidFileException) as error:
         print(f'Ошибка обработки: {error}', file=sys.stderr)
         return 1
 
-    for warning in result['warnings']:
+    for warning in result.get('warnings', []):
         print(warning, file=sys.stderr)
+    for error in result.get('source_fill', {}).get('errors', []):
+        print(f'Не удалось заполнить копию исходной книги: {error}', file=sys.stderr)
     print(f'Excel: {args.output / "schools.xlsx"}')
     print(f'Журнал: {args.output / "processing_log.json"}')
+    print(f'Шаблон ручных решений: {args.output / "manual_decisions.xlsx"}')
 
     print(
         json.dumps(
@@ -912,7 +940,7 @@ def main(argv=None):
 
     return (
         2
-        if result["full_summary"]["Ошибка или пропуск запроса"]
+        if result["full_summary"]["Ошибка или пропуск запроса"] or result.get('source_fill', {}).get('errors')
         else 0
     )
 

@@ -2,11 +2,13 @@
 const $ = id => document.getElementById(id);
 let files = [], config = null, busy = false, currentJob = null, timer = null, registryTimer = null, licensesTimer = null;
 const sheets = new Map();
+let manualPending = 0;
 function showError(message) { $('error').textContent = message; $('error').hidden = !message; }
 function setBusy(value) { busy = value; $('controls').disabled = value; updateButton(); }
 function updateButton() {
   $('start').disabled = busy || !files.length || !config;
   $('check-dadata').disabled = busy || !files.length || !config;
+  $('manual-file').disabled = busy || !currentJob || !manualPending;
   $('start').firstChild.textContent = !files.length ? 'Сначала загрузите Excel ' : 'Обработать таблицы ';
 }
 function updateConnection() {
@@ -203,6 +205,13 @@ function renderResult(job) {
     $('filled-downloads').append(link, document.createElement('br'));
   }
   $('journal').href = job.journal; $('journal').hidden = !job.journal;
+  $('manual-review').hidden = !job.manual_template;
+  $('manual-template').href = job.manual_template;
+  manualPending = job.manual_pending || 0;
+  $('manual-status').textContent = manualPending
+    ? `Групп для ручного решения: ${manualPending}. В шаблоне указаны до трёх кандидатов и причины проверки.`
+    : 'Неподтверждённых групп сопоставления нет. Поля писем и причины отбора проверяйте в итоговом Excel.';
+  updateButton();
   $('result-title').textContent = job.partial ? 'Таблица готова частично' : 'Таблица готова';
   $('metrics').replaceChildren();
   for (const [value, label] of [[job.summary.rows,'строк обработано'],[job.summary.schools,'учреждений объединено'],[job.summary.students,'пар ФИО и номер дела'],[job.summary.review,'строк требуют проверки']]) {
@@ -222,6 +231,25 @@ function renderResult(job) {
     $('preview').append(tr);
   }
 }
+$('manual-file').onchange = async e => {
+  const file = e.target.files[0];
+  if (!file || busy || !currentJob) return;
+  if (!file.name.toLowerCase().endsWith('.xlsx') || file.size > 6 * 1024 * 1024) {
+    e.target.value = ''; return showError('Выберите заполненный шаблон .xlsx размером до 6 МБ.');
+  }
+  showError(''); setBusy(true); $('manual-status').textContent = 'Проверяем решения и обновляем Excel…';
+  try {
+    const encoded = await encodeFile(file);
+    const response = await request('/api/jobs/' + currentJob + '/decisions-import', {
+      method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf},
+      body:JSON.stringify({data:encoded.data})
+    });
+    renderResult(response.job);
+    $('manual-status').textContent = `Применено решений: ${response.imported}. Статус — ПРОВЕРЕНО. Отчёт, журнал и копии исходных книг обновлены.`;
+  } catch (error) {
+    showError(error.message); $('manual-status').textContent = 'Импорт не завершён. Проверьте сообщение об ошибке.';
+  } finally { e.target.value = ''; setBusy(false); }
+};
 async function init() {
   try {
     config = await request('/api/config');

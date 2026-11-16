@@ -13,6 +13,7 @@ from .license_registry import SOURCE_PAGE as LICENSE_SOURCE_PAGE
 from .license_registry import current_snapshot as current_license_snapshot
 from .normalization import expanded_key, institution_type, normalize, numbers
 from .registry import current_snapshot
+from .manual_review import confirmed_for
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 
@@ -475,7 +476,8 @@ class RegistrySearch:
         return result, len(found) > 2000
 
 
-def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, config=None, licenses=None):
+def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, config=None, licenses=None,
+            manual_decisions=None):
     cfg = config or _DEFAULT_CONFIG
     by_id = {r['record_id']: r for r in result['records']}
     resolutions, candidates = [], []
@@ -484,10 +486,12 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             check_cancel()
         record = by_id[group['record_ids'][0]]
         found = []
-        selected, ranked = None, []
+        decision = confirmed_for([by_id[rid] for rid in group['record_ids']], manual_decisions or {})
+        selected = decision['candidate'] if decision else None
+        ranked = [dict(selected, eligible=True, reasons=[])] if decision else []
         license_used, license_truncated = False, False
         license_inns = set()
-        if licenses is not None:
+        if not selected and licenses is not None:
             if check_cancel:
                 check_cancel()
             license_used = True
@@ -533,7 +537,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
         candidates.extend({**c, 'group_id': group['group_id']} for c in unique.values())
 
         if selected:
-            status = 'СОПОСТАВЛЕНО'
+            status = 'ПРОВЕРЕНО' if decision else 'СОПОСТАВЛЕНО'
         elif any('ОБРЕЗАННОЕ_НАЗВАНИЕ' in c['reasons'] for c in ranked) or 'ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ' in record.get('flags', []):
             status = 'ПРОВЕРИТЬ_ОБРЕЗКА'
         elif any('КОНФЛИКТ_РЕГИОНА' in c['reasons'] or 'REGION_НЕ_СОВПАЛ' in c['reasons'] for c in ranked) or 'КОНФЛИКТ_РЕГИОНА' in record.get('flags', []):
@@ -554,6 +558,9 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             'license_used': license_used, 'license_truncated': license_truncated,
             'registry_used': registry_used, 'registry_truncated': truncated,
             'candidate_count': len(unique)})
+        if decision:
+            resolutions[-1].update(manual_decision=True, manual_comment=decision['comment'],
+                                   manual_reviewed_at=decision['reviewed_at'])
         if progress:
             requests_count = api.actual_requests if api is not None else 0
             print(f"{index}/{len(result['groups'])}: {status}; DaData={requests_count}", flush=True)
