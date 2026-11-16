@@ -769,7 +769,9 @@ def prepare_letters(result, overrides=None):
         regions = {c.get('region') for c in selected if c.get('region')}
         ogrns = {c.get('candidate_ogrn') for c in selected if c.get('candidate_ogrn')}
         statuses = {g.get('status', '') for g in groups}
-        match_status = ('АВТО' if row['inn'] and statuses <= {'АВТО', 'СОПОСТАВЛЕНО'}
+        comments = sorted({g['manual_comment'] for g in groups if g.get('manual_comment')})
+        match_status = ('ПРОВЕРЕНО' if row['inn'] and 'ПРОВЕРЕНО' in statuses
+                        else 'АВТО' if row['inn'] and statuses <= {'АВТО', 'СОПОСТАВЛЕНО'}
                         else 'ПРОВЕРИТЬ' if statuses == {'ПРОВЕРИТЬ'} else 'ВРУЧНАЯ')
         flags = {flag for r in members for flag in r.get('flags', [])}
         if not row['postal_code']:
@@ -781,7 +783,7 @@ def prepare_letters(result, overrides=None):
                    match_status=match_status,
                    source_names=' || '.join(sorted({r['name'] for r in members})),
                    flags='; '.join(sorted(flags)),
-                   operator_comment='')
+                   operator_comment='\n'.join(comments))
 
     result["letters_ready"] = ready
     result["letters_review"] = review

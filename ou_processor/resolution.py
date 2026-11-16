@@ -13,6 +13,7 @@ from .license_registry import SOURCE_PAGE as LICENSE_SOURCE_PAGE
 from .license_registry import current_snapshot as current_license_snapshot
 from .normalization import expanded_key, institution_type, normalize, numbers
 from .registry import current_snapshot
+from .manual_review import confirmed_for
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
 
@@ -503,7 +504,8 @@ def acceptance_status(selected, ranked, record, config):
     return 'ВРУЧНАЯ'
 
 
-def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, config=None, licenses=None):
+def resolve(result, api, registry, progress=True, on_progress=None, check_cancel=None, config=None, licenses=None,
+            manual_decisions=None):
     cfg = config or _DEFAULT_CONFIG
     by_id = {r['record_id']: r for r in result['records']}
     resolutions, candidates = [], []
@@ -512,10 +514,12 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             check_cancel()
         record = by_id[group['record_ids'][0]]
         found = []
-        selected, ranked = None, []
+        decision = confirmed_for([by_id[rid] for rid in group['record_ids']], manual_decisions or {})
+        selected = decision['candidate'] if decision else None
+        ranked = [dict(selected, eligible=True, reasons=[])] if decision else []
         license_used, license_truncated = False, False
         license_inns = set()
-        if licenses is not None:
+        if not selected and licenses is not None:
             if check_cancel:
                 check_cancel()
             license_used = True
@@ -544,7 +548,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
         conflict = ''
         unverified = None
         dadata_check = None
-        if api is not None:
+        if api is not None and not decision:
             if selected:
                 # По ИНН уточняем адрес и статус, не заменяя образовательные атрибуты.
                 if check_cancel:
@@ -598,7 +602,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             if check_cancel:
                 check_cancel()
 
-        if selected and api is None:
+        if selected and api is None and not decision:
             unverified, selected = selected, None
         if license_truncated or truncated:
             selected = unverified = None
@@ -614,7 +618,7 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
         elif unverified:
             status = 'ЮРИДИЧЕСКИЙ_СТАТУС_НЕ_ПОДТВЕРЖДЁН'
         elif selected:
-            status = 'СОПОСТАВЛЕНО'
+            status = 'ПРОВЕРЕНО' if decision else 'СОПОСТАВЛЕНО'
         elif any('ОБРЕЗАННОЕ_НАЗВАНИЕ' in c['reasons'] for c in ranked) or 'ПОДОЗРЕНИЕ_НА_ОБРЕЗКУ' in record.get('flags', []):
             status = 'ПРОВЕРИТЬ_ОБРЕЗКА'
         elif any('КОНФЛИКТ_РЕГИОНА' in c['reasons'] or 'REGION_НЕ_СОВПАЛ' in c['reasons'] for c in ranked) or 'КОНФЛИКТ_РЕГИОНА' in record.get('flags', []):
@@ -631,7 +635,9 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             status = 'НЕ_СОПОСТАВЛЕНО'
 
         final_status = 'ВРУЧНАЯ' if conflict or license_truncated or truncated else acceptance_status(selected, ranked, record, cfg)
-        if unverified:
+        if decision:
+            final_status = 'ПРОВЕРЕНО'
+        elif unverified:
             final_status = 'ПРОВЕРИТЬ'
         review_candidate = (unverified or max(ranked, key=lambda c: c['score'])) if final_status == 'ПРОВЕРИТЬ' else None
         resolutions.append({'group_id': group['group_id'], 'record_ids': group['record_ids'],
@@ -641,6 +647,9 @@ def resolve(result, api, registry, progress=True, on_progress=None, check_cancel
             'license_used': license_used, 'license_truncated': license_truncated,
             'registry_used': registry_used, 'registry_truncated': truncated,
             'candidate_count': len(unique)})
+        if decision:
+            resolutions[-1].update(manual_decision=True, manual_comment=decision['comment'],
+                                   manual_reviewed_at=decision['reviewed_at'])
         if progress:
             requests_count = api.actual_requests if api is not None else 0
             print(f"{index}/{len(result['groups'])}: {status}; DaData={requests_count}", flush=True)

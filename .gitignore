@@ -8,6 +8,8 @@
 *.pfx
 credentials*
 secrets*
+manual_decisions.json
+manual_decisions.json.tmp
 
 # Входные данные, результаты и кэши
 *.xlsx

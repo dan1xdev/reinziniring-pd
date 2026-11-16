@@ -27,7 +27,7 @@ class _AvailableIndex:
 
 
 def search(result, registry_path, config, *, licenses_path=None, cache=None, client=None,
-           on_progress=None, check_cancel=None):
+           on_progress=None, check_cancel=None, manual_decisions=None):
     warnings, opened = [], []
     registry = licenses = None
     result['processing_mode'] = 'cascade' if client is not None else 'registry'
@@ -53,7 +53,7 @@ def search(result, registry_path, config, *, licenses_path=None, cache=None, cli
             if getattr(api, 'warning', ''):
                 warnings.append(api.warning)
         resolve(result, api, registry, progress=False, config=config, licenses=licenses,
-                on_progress=on_progress, check_cancel=check_cancel)
+                on_progress=on_progress, check_cancel=check_cancel, manual_decisions=manual_decisions)
         if client is None:
             warnings.append('Ключ DaData не настроен: проверка ограничена локальными источниками; адрес и юридический статус не уточнены через DaData.')
         elif any(g['decision_reason'] == 'КОНФЛИКТ_ИНН' for g in result['resolution']['groups']):
@@ -84,6 +84,9 @@ def write_log(result, destination):
             'license_truncated': group.get('license_truncated', False),
             'registry_used': group['registry_used'],
             'registry_truncated': group.get('registry_truncated', False),
+            'manual_decision': group.get('manual_decision', False),
+            'manual_comment': group.get('manual_comment', ''),
+            'manual_reviewed_at': group.get('manual_reviewed_at', ''),
             'candidates': [{k: c.get(k) for k in ('candidate_inn', 'source', 'source_url', 'score', 'eligible', 'reasons')}
                            for c in candidates.get(group['group_id'], [])],
         })
