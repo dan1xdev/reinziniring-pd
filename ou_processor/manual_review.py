@@ -224,7 +224,8 @@ def apply_import(result, content, entries):
         decision['candidate'].pop('group_id', None)
         for rid in group['record_ids']:
             saved[manual_key(records[rid])] = deepcopy(decision)
-        group.update(selected=deepcopy(candidate), status='ПРОВЕРЕНО', manual_decision=True,
+        group.update(selected=deepcopy(candidate), status='ПРОВЕРЕНО', decision_reason='ПРОВЕРЕНО',
+                     review_candidate=None, manual_decision=True,
                      manual_comment=comment, manual_reviewed_at=now)
         if candidate not in updated['resolution']['candidates']:
             updated['resolution']['candidates'].append(deepcopy(candidate))

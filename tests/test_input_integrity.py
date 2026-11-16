@@ -86,7 +86,7 @@ class InputIntegrityTests(unittest.TestCase):
             path = Path(tmp) / "input.xlsx"
             workbook = Workbook()
             sheet = workbook.active
-            sheet.append(["Образовательное учреждение", "Вид образования", "Год завершения"])
+            sheet.append(["Образовательное учреждение", "Вид образования", "Год завершения", "ФИО"])
             sheet.append(["Школа № 1", "Среднее общее", datetime.datetime(2001, 3, 9)])
             workbook.save(path)
             records, sources = read_records([path])
@@ -111,7 +111,7 @@ class InputIntegrityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "input.xlsx"
             workbook = Workbook()
-            workbook.active.append(["Образовательное учреждение", "Вид образования", "Код специальности"])
+            workbook.active.append(["Образовательное учреждение", "Вид образования", "Код специальности", "ФИО"])
             workbook.active.append(["Школа № 1", "Среднее общее", datetime.datetime(2001, 3, 9)])
             workbook.save(path)
             records, _ = read_records([path])
@@ -126,7 +126,7 @@ class InputIntegrityTests(unittest.TestCase):
             path = Path(tmp) / "input.xlsx"
             workbook = Workbook()
             sheet = workbook.active
-            sheet.append(["Образовательное учреждение", "Вид образования", "ИНН"])
+            sheet.append(["Образовательное учреждение", "Вид образования", "ИНН", "ФИО"])
             sheet.append(["Школа № 1, г. Минск", "Среднее общее", 123456788])
             sheet["C2"].number_format = "0000000000"
             workbook.save(path)

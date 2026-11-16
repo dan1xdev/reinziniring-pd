@@ -32,27 +32,37 @@ def read_error(header, rows=()):
 class RequiredFieldMessageTests(unittest.TestCase):
     def test_message_lists_found_columns(self):
         message = read_error(
-            ["ФИО", "Образовательное учреждение", "Год завершения"],
-            [["Иванов", "Школа 1", 2020]],
+            ["ФИО", "Год завершения"],
+            [["Тестовая запись", 2020]],
         )
-        self.assertIn("найдены", message)
+        found_part = message.split("не найдены обязательные колонки:")[0]
+        self.assertIn("найдены колонки:", found_part)
+        self.assertIn("«ФИО»", found_part)
+        self.assertNotIn("«Образовательное учреждение»", found_part)
+
+    def test_message_lists_missing_columns(self):
+        message = read_error(["Вид образования"], [["Среднее общее"]])
+        self.assertIn("не найдены", message)
         self.assertIn("«ФИО»", message)
         self.assertIn("«Образовательное учреждение»", message)
 
-    def test_message_lists_missing_columns(self):
-        message = read_error(["ФИО", "Образовательное учреждение"], [["Иванов", "Школа 1"]])
-        self.assertIn("не найдены", message)
-        self.assertIn("«Вид образования»", message)
-        self.assertIn("«Тип документа об образовании»", message)
-
     def test_found_columns_not_repeated_as_missing(self):
-        message = read_error(
-            ["ФИО", "Образовательное учреждение", "Год завершения"],
-            [["Иванов", "Школа 1", 2020]],
-        )
+        message = read_error(["ФИО", "Год завершения"], [["Тестовая запись", 2020]])
         missing_part = message.split("не найдены")[-1]
         self.assertNotIn("«ФИО»", missing_part)
-        self.assertNotIn("«Образовательное учреждение»", missing_part)
+        self.assertIn("«Образовательное учреждение»", missing_part)
+
+    def test_name_and_student_are_sufficient(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            make_book(path, [["ФИО", "Образовательное учреждение"], ["", "Школа 1"]])
+            records, _ = read_records([path])
+        self.assertEqual(records[0]["name"], "Школа 1")
+
+    def test_student_column_is_required(self):
+        message = read_error(["Образовательное учреждение", "Вид образования"],
+                             [["Школа 1", "Среднее общее"]])
+        self.assertIn("«ФИО»", message.split("не найдены обязательные колонки:")[-1])
 
     def test_document_replaces_education_no_error(self):
         header = ["ФИО", "Образовательное учреждение", "Тип документа об образовании"]
@@ -150,6 +160,20 @@ class SheetSelectionTests(unittest.TestCase):
         self.assertIn("Не нашли", sources[0]["skipped_sheets"])
         self.assertIn("Коллективу (1 чел)", sources[0]["skipped_sheets"])
 
+    def test_auto_selects_first_content_sheet_and_skips_remaining(self):
+        header = ["ФИО", "Образовательное учреждение", "Вид образования"]
+        sheets = [
+            ("Инструкция", [["Описание выгрузки"]]),
+            ("Пустой", [header]),
+            ("Лист рабочий", [header, ["", "Школа 1", "Среднее общее"]]),
+            ("Лист1", [header, ["", "Школа 2", "Среднее общее"]]),
+            ("100 записей", [header, ["", "Школа 3", "Среднее общее"]]),
+        ]
+        records, sources = self.read_multi(sheets)
+        self.assertEqual([record["name"] for record in records], ["Школа 1"])
+        self.assertEqual(sources[0]["rows"], 1)
+        self.assertEqual(sources[0]["skipped_sheets"], ["Инструкция", "Пустой", "Лист1", "100 записей"])
+
     def test_explicit_sheet_selection(self):
         header = ["ФИО", "Образовательное учреждение", "Вид образования"]
         sheets = [
@@ -160,6 +184,11 @@ class SheetSelectionTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["student_name"], "Петров")
         self.assertIn("Лист А", sources[0]["skipped_sheets"])
+
+    def test_explicit_empty_sheet_reports_missing_data(self):
+        header = ["ФИО", "Образовательное учреждение"]
+        with self.assertRaisesRegex(ValueError, "нет строк с данными"):
+            self.read_multi([("Пустой", [header])], sheet_name="Пустой")
 
     def test_copy_of_working_sheet_ignored(self):
         header = ["ФИО", "Образовательное учреждение", "Вид образования"]
@@ -255,6 +284,39 @@ class FormatSupportTests(unittest.TestCase):
             self.assertEqual(records[0]["name"], "ГБОУ Школа № 1284")
             self.assertEqual(records[0]["document"], "Аттестат о среднем общем образовании")
 
+class ConfiguredColumnsTests(unittest.TestCase):
+    def test_custom_aliases_are_used_without_losing_default_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            make_book(path, [
+                ["Участник", "Исходная организация", "Тип документа об образовании"],
+                ["", "Школа 1", "Аттестат"],
+            ])
+            records, _ = read_records([path], config={"input_column_aliases": {
+                "student_name": ["Участник"], "name": ["Исходная организация"],
+            }})
+        self.assertEqual(records[0]["name"], "Школа 1")
+        self.assertEqual(records[0]["document"], "Аттестат")
+
+    def test_specialty_date_keeps_code_and_birth_date_keeps_date(self):
+        import datetime
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "in.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.append(["ФИО", "Образовательное учреждение", "Код специальности", "Дата рождения"])
+            sheet.append(["", "Школа 1", datetime.datetime(2001, 3, 9), datetime.datetime(2001, 3, 9)])
+            sheet["C2"].number_format = "dd.mm.yy"
+            sheet["D2"].number_format = "dd.mm.yyyy"
+            book.save(path)
+            records, _ = read_records([path], config={"input_column_aliases": {
+                "birth_date": ["Дата рождения"],
+            }})
+        self.assertEqual(records[0]["specialty_code"], "09.03.01")
+        self.assertEqual(records[0]["birth_date"], "2001-03-09 00:00:00")
+        self.assertEqual(records[0]["damaged_fields"], ["specialty_code"])
+
+
 class ExclusionLogicTests(unittest.TestCase):
     def process_row(self, name, inn="", address="", education="Среднее общее", **extra):
         import json
@@ -339,6 +401,7 @@ class DamagedScopeTests(unittest.TestCase):
         record = self.read_row(
             ["ФИО", "Образовательное учреждение", "Вид образования", "Код специальности"],
             ["Иванов", "Школа 1", "Среднее общее", datetime.datetime(2001, 3, 9)])
+        self.assertEqual(record["specialty_code"], "09.03.01")
         self.assertEqual(record["input_flags"].count("ПОВРЕЖДЁН_КОД_EXCEL"), 1)
 
     def test_numeric_inn_index_and_file_number_not_flagged(self):

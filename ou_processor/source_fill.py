@@ -1,13 +1,16 @@
 """Заполнение целевых полей в отдельной копии исходных книг Excel."""
 
 from collections import Counter, defaultdict
-from copy import copy
 from pathlib import Path
 import re
-import shutil
+import posixpath
+from xml.etree import ElementTree
+from xml.parsers import expat
+from xml.sax.saxutils import escape, quoteattr
+from zipfile import ZipFile
 
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, coordinate_to_tuple, range_boundaries
 
 from .normalization import normalize
 
@@ -99,6 +102,7 @@ def _record_values(result):
         str(row.get("inn") or "").strip(): row
         for row in letters
         if str(row.get("inn") or "").strip()
+        and row.get("match_status", "АВТО") in {"АВТО", "ПРОВЕРЕНО"}
     }
 
     values_by_record = {}
@@ -171,7 +175,7 @@ def _find_header_row(sheet, preferred=None):
     return best_row
 
 
-def _target_columns(sheet, header_row):
+def _target_columns(sheet, header_row, updates):
     header_values = {
         normalize(cell.value): cell.column
         for cell in sheet[header_row]
@@ -190,16 +194,7 @@ def _target_columns(sheet, header_row):
         if found is None:
             found = sheet.max_column + 1
             cell = sheet.cell(header_row, found, spec["header"])
-            if found > 1:
-                previous = sheet.cell(header_row, found - 1)
-                if previous.has_style:
-                    cell._style = copy(previous._style)
-                if previous.alignment:
-                    cell.alignment = copy(previous.alignment)
-            cell.number_format = "@"
-            sheet.column_dimensions[get_column_letter(found)].width = (
-                48 if field in {"official_name", "genitive_name", "address"} else 14
-            )
+            updates[cell.coordinate] = spec["header"]
             header_values[normalize(spec["header"])] = found
 
         columns[field] = found
@@ -207,17 +202,162 @@ def _target_columns(sheet, header_row):
     return columns
 
 
-def _has_formulas(path):
-    book = load_workbook(path, read_only=True, data_only=False)
-    try:
-        return any(
-            cell.data_type == "f"
-            for sheet in book
-            for row in sheet
-            for cell in row
-        )
-    finally:
-        book.close()
+def _sheet_parts(archive):
+    """Разрешает имена листов через связи, не полагаясь на их порядок."""
+    relations = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    targets = {
+        item.attrib["Id"]: posixpath.normpath(
+            posixpath.join("xl", item.attrib["Target"])
+        ).lstrip("/")
+        for item in relations
+    }
+    workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    relation = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    return {
+        sheet.attrib["name"]: targets[sheet.attrib[relation]]
+        for sheet in workbook.findall(f"{{{namespace}}}sheets/{{{namespace}}}sheet")
+    }
+
+
+def _sheet_spans(xml):
+    """Находит байтовые границы элементов без повторной сериализации XML."""
+    parser = expat.ParserCreate()
+    stack = []
+    root = None
+    opening_tag = re.compile(br"(?:[^>\"']|\"[^\"]*\"|'[^']*')*>")
+
+    def start(tag, attributes):
+        nonlocal root
+        local = tag.rsplit(":", 1)[-1]
+        parent = stack[-1] if stack else None
+        allowed = {
+            "worksheet": {"sheetData", "dimension"},
+            "sheetData": {"row"},
+            "row": {"c"},
+        }
+        if (not stack and local == "worksheet") or (
+            parent and local in allowed.get(parent["local"], set())
+        ):
+            offset = parser.CurrentByteIndex
+            opening = opening_tag.match(xml, offset)
+            node = {
+                "tag": tag, "local": local, "attrs": attributes, "start": offset,
+                "open_end": opening.end(), "children": [],
+            }
+            if parent:
+                parent["children"].append(node)
+            else:
+                root = node
+            stack.append(node)
+        else:
+            stack.append(None)
+
+    def end(tag):
+        node = stack.pop()
+        if node is None:
+            return
+        self_closing = xml[node["start"]:node["open_end"]].rstrip().endswith(b"/>")
+        node["close_start"] = node["open_end"] if self_closing else parser.CurrentByteIndex
+        node["end"] = node["open_end"] if self_closing else xml.index(b">", parser.CurrentByteIndex) + 1
+        node["self_closing"] = self_closing
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.Parse(xml, True)
+    return root
+
+
+def _xml_tag(tag, attributes):
+    return "<" + tag + "".join(f" {key}={quoteattr(value)}" for key, value in attributes.items()) + ">"
+
+
+def _inline_cell(coordinate, value, prefix, attributes=None):
+    attributes = {**(attributes or {}), "r": coordinate, "t": "inlineStr"}
+    text = escape(value).replace("\r", "&#13;")
+    return (
+        _xml_tag(prefix + "c", attributes)
+        + f'<{prefix}is><{prefix}t xml:space="preserve">{text}</{prefix}t></{prefix}is></{prefix}c>'
+    ).encode("utf-8")
+
+
+def _apply_xml_edits(xml, edits):
+    # Объединяем вставки в одну позицию, чтобы сохранить порядок новых ячеек.
+    combined = defaultdict(bytes)
+    for start, end, content in edits:
+        combined[start, end] += content
+    chunks = []
+    position = 0
+    for (start, end), content in sorted(combined.items()):
+        chunks.extend((xml[position:start], content))
+        position = end
+    chunks.append(xml[position:])
+    return b"".join(chunks)
+
+
+def _patch_sheet(xml, updates, dimension):
+    root = _sheet_spans(xml)
+    sheet_data = next(node for node in root["children"] if node["local"] == "sheetData")
+    prefix = sheet_data["tag"][:-len("sheetData")]
+    rows = {int(row["attrs"]["r"]): row for row in sheet_data["children"]}
+    grouped = defaultdict(dict)
+    for coordinate, value in updates.items():
+        grouped[coordinate_to_tuple(coordinate)[0]][coordinate] = value
+    edits = []
+    for number, values in sorted(grouped.items()):
+        row = rows.get(number)
+        cells = {cell["attrs"]["r"]: cell for cell in row["children"]} if row else {}
+        additions = []
+        for coordinate, value in sorted(values.items(), key=lambda item: coordinate_to_tuple(item[0])):
+            cell = cells.get(coordinate)
+            content = _inline_cell(coordinate, value, prefix, cell["attrs"] if cell else None)
+            if cell:
+                edits.append((cell["start"], cell["end"], content))
+            elif row and not row["self_closing"]:
+                later = [node["start"] for ref, node in cells.items()
+                         if coordinate_to_tuple(ref)[1] > coordinate_to_tuple(coordinate)[1]]
+                offset = min(later) if later else row["close_start"]
+                edits.append((offset, offset, content))
+            else:
+                additions.append(content)
+        if additions:
+            tag = row["tag"] if row else prefix + "row"
+            attributes = row["attrs"] if row else {"r": str(number)}
+            content = _xml_tag(tag, attributes).encode() + b"".join(additions) + f"</{tag}>".encode()
+            if row:
+                edits.append((row["start"], row["end"], content))
+            else:
+                later = [node["start"] for index, node in rows.items() if index > number]
+                offset = min(later) if later else sheet_data["close_start"]
+                edits.append((offset, offset, content))
+
+    existing_dimension = next((node for node in root["children"] if node["local"] == "dimension"), None)
+    bounds = range_boundaries(dimension)
+    if existing_dimension:
+        previous = range_boundaries(existing_dimension["attrs"]["ref"])
+        bounds = (min(bounds[0], previous[0]), min(bounds[1], previous[1]),
+                  max(bounds[2], previous[2]), max(bounds[3], previous[3]))
+    reference = f"{get_column_letter(bounds[0])}{bounds[1]}:{get_column_letter(bounds[2])}{bounds[3]}"
+    if existing_dimension:
+        attributes = {**existing_dimension["attrs"], "ref": reference}
+        content = (_xml_tag(existing_dimension["tag"], attributes)[:-1] + "/>").encode()
+        edits.append((existing_dimension["start"], existing_dimension["end"], content))
+    # dimension необязателен: при отсутствии Excel вычислит границы по ячейкам.
+    return _apply_xml_edits(xml, edits)
+
+
+def _write_copy(source, destination, updates, book):
+    with ZipFile(source) as original, ZipFile(destination, "w") as copied:
+        parts = _sheet_parts(original)
+        changes = {parts[name]: (values, book[name].calculate_dimension())
+                   for name, values in updates.items() if values}
+        copied.comment = original.comment
+        for item in original.infolist():
+            content = original.read(item)
+            if item.filename in changes:
+                values, dimension = changes[item.filename]
+                content = _patch_sheet(content, values, dimension)
+            copied.writestr(item, content)
 
 
 def fill_source_copies(result, output):
@@ -250,18 +390,13 @@ def fill_source_copies(result, output):
             )
             continue
 
-        if _has_formulas(source_path):
-            stats["errors"].append(
-                f"{source_path.name}: копия не создана из-за формул в исходной книге."
-            )
-            continue
-
         destination = filled_dir / (
             f"{source_id}_{source_path.stem}_заполнен.xlsx"
         )
-        shutil.copy2(source_path, destination)
-
-        book = load_workbook(destination)
+        book = load_workbook(source_path)
+        updates = defaultdict(dict)
+        column_cache = {}
+        array_formula_ranges = {}
         file_rows = 0
         field_present = Counter()
         field_written = Counter()
@@ -277,16 +412,29 @@ def fill_source_copies(result, output):
                     continue
 
                 sheet = book[sheet_name]
-                header_row = _find_header_row(
-                    sheet, item["meta"].get("header_row")
-                )
-                columns = _target_columns(sheet, header_row)
+                if sheet_name not in array_formula_ranges:
+                    array_formula_ranges[sheet_name] = [
+                        range_boundaries(reference) for reference in sheet.array_formulae.values()
+                    ]
+                header_key = (sheet_name, item["meta"].get("header_row"))
+                if header_key not in column_cache:
+                    header_row = _find_header_row(sheet, header_key[1])
+                    column_cache[header_key] = _target_columns(sheet, header_row, updates[sheet_name])
+                columns = column_cache[header_key]
                 row_number = int(row_number)
                 file_rows += 1
 
                 for field, column in columns.items():
                     cell = sheet.cell(row_number, column)
                     value = str(item["values"].get(field) or "").strip()
+                    # Защищаем и формулу, и все ячейки результата формулы массива.
+                    in_array_formula = any(
+                        first_col <= column <= last_col and first_row <= row_number <= last_row
+                        for first_col, first_row, last_col, last_row in array_formula_ranges[sheet_name]
+                    )
+                    if cell.data_type == "f" or in_array_formula:
+                        field_present[field] += 1
+                        continue
                     # Пустое или неподтверждённое значение не стирает исходные данные.
                     if value:
                         if field == "address" and cell.value is not None and str(cell.value).strip():
@@ -295,12 +443,12 @@ def fill_source_copies(result, output):
                                 continue
                         cell.value = value
                         cell.data_type = "s"
-                        cell.number_format = "@"
+                        updates[sheet_name][cell.coordinate] = value
                         field_written[field] += 1
                     if cell.value is not None and str(cell.value).strip():
                         field_present[field] += 1
 
-            book.save(destination)
+            _write_copy(source_path, destination, updates, book)
         finally:
             book.close()
 

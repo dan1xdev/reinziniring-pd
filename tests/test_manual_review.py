@@ -83,6 +83,14 @@ class ManualReviewTests(unittest.TestCase):
             self.assertEqual(updated['schools'][0]['status'], 'ПРОВЕРЕНО')
             self.assertEqual(updated['review'], [])
             self.assertEqual(updated['records'][0]['manual_comment'], 'Проверено оператором')
+            report = load_workbook(root / 'result' / 'schools.xlsx', read_only=True)
+            try:
+                rows = report['Письма'].values
+                letter = dict(zip(next(rows), next(rows)))
+                self.assertEqual(letter['Статус сопоставления'], 'ПРОВЕРЕНО')
+                self.assertEqual(letter['Комментарий оператора'], 'Проверено оператором')
+            finally:
+                report.close()
             copy_path = root / 'result' / 'filled_sources' / updated['source_fill']['copies'][0]['file']
             book = load_workbook(copy_path)
             try:
@@ -301,7 +309,13 @@ class ManualReviewTests(unittest.TestCase):
             self.assertEqual((folder / 'result.json').read_bytes(), before)
             self.assertFalse((root / 'store.json').exists())
             self.assertIsNone(app.active)
-            response = app.import_decisions(job_id, {'data': base64.b64encode(decisions(result)).decode()})
+            payload = {'data': base64.b64encode(decisions(result)).decode()}
+            with patch('ou_processor.web.save_store', side_effect=OSError('Справочник недоступен')):
+                with self.assertRaises(UserError):
+                    app.import_decisions(job_id, payload)
+            self.assertEqual((folder / 'result.json').read_bytes(), before)
+            self.assertIsNone(app.active)
+            response = app.import_decisions(job_id, payload)
             self.assertEqual(response['imported'], 1)
             self.assertEqual(response['job']['manual_pending'], 0)
             self.assertEqual(response['job']['summary']['verified'], 1)
