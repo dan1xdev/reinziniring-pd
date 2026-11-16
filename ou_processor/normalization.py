@@ -90,11 +90,24 @@ def institution_type(value, config=None):
 
 
 def abbreviation_flags(value, config=None):
-    abbr_map = config.get("abbreviations", ABBREVIATIONS) if config else ABBREVIATIONS
+    cfg = config if config is not None else _DEFAULT_CONFIG
+    abbr_map = cfg.get("abbreviations", ABBREVIATIONS)
     key = normalize(value)
     flags = []
     if any(word in abbr_map for word in key.split()):
         flags.append("СОКРАЩЕНИЯ")
     if not institution_type(value, config=config) and len(key.split()) <= 5:
         flags.append("НЕЯСНОЕ_НАЗВАНИЕ")
+
+    words = re.findall(r"[a-zа-яё]+", text(value), flags=re.IGNORECASE)
+    known = {normalize(word) for word in abbr_map}
+    known.update(normalize(word) for word in cfg.get("abbreviation_exceptions", []))
+    known.update(normalize(word) for word in cfg.get("stop_words", []))
+    # Сплошной верхний регистр — оформление названия, а не признак каждого сокращения.
+    # Отдельное короткое слово или сокращение среди обычных слов проверяем по словарю.
+    all_upper_title = len(words) > 1 and all(word.isupper() for word in words)
+    if not all_upper_title and any(
+            2 <= len(word) <= 6 and word.isupper() and normalize(word) not in known
+            for word in words):
+        flags.append("НЕИЗВЕСТНАЯ_АББРЕВИАТУРА")
     return flags

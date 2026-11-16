@@ -4,11 +4,13 @@ from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from unittest.mock import patch
 from openpyxl import Workbook, load_workbook
 from ou_processor.web import Application, Handler, JobCancelled, UserError, unpack_uploads
@@ -32,6 +34,7 @@ def school_upload():
     return {'name':'schools.xlsx', 'data':base64.b64encode(stream.getvalue()).decode()}
 
 
+@patch.dict(os.environ, {'DADATA_API_KEY': ''})
 class UploadTests(unittest.TestCase):
     def test_filled_source_is_listed_and_downloadable(self):
         class Probe:
@@ -68,7 +71,7 @@ class UploadTests(unittest.TestCase):
             Handler.do_GET(unknown)
             self.assertEqual(unknown.response[0], 404)
 
-    def test_formula_book_is_reported_as_partial_result(self):
+    def test_formula_book_produces_filled_copy_preserving_formula(self):
         workbook = Workbook()
         workbook.active.append(['Образовательное учреждение', 'Вид образования', 'ФИО', 'Личное дело.Номер'])
         workbook.active.append(['ГБОУ г. Москвы «Школа № 1»', 'Среднее общее', 'Иванов Иван', '0001'])
@@ -95,13 +98,16 @@ class UploadTests(unittest.TestCase):
                 time.sleep(.01)
             job = app.snapshot(job_id)
             self.assertEqual(job['status'], 'done', job.get('error'))
-            self.assertTrue(job['partial'])
-            self.assertEqual(job['filled_sources'], [])
-            self.assertTrue(any('формул' in text.lower() for text in job['warnings']))
+            self.assertFalse(job['partial'])
+            self.assertEqual(len(job['filled_sources']), 1)
+            filled = Path(root) / 'runs' / job_id / 'result' / 'filled_sources' / job['filled_sources'][0]['file']
+            with zipfile.ZipFile(filled) as actual, zipfile.ZipFile(io.BytesIO(stream.getvalue())) as original:
+                self.assertEqual(actual.read('xl/worksheets/sheet2.xml'), original.read('xl/worksheets/sheet2.xml'))
 
     # Порог из файла настроек текущего запуска влияет на подбор и итоговый Excel.
     def test_processing_uses_current_config_threshold(self):
         config = json.loads((Path(__file__).resolve().parents[1] / 'config.json').read_text(encoding='utf-8'))
+        config['allow_accreditation_fallback'] = True
         cached = dict(candidate_inn='123', candidate_name='ГБОУ школа № 1', candidate_ogrn='456',
             postal_code='123456', region='Москва', city='Москва', address='Москва, ул А, д 1',
             legal_status='ACTIVE', branch_type='MAIN', source='DaData')
@@ -111,9 +117,14 @@ class UploadTests(unittest.TestCase):
                 config['scoring']['thresholds']['auto_match_min_score'] = threshold
                 (root / 'config.json').write_text(json.dumps(config), encoding='utf-8')
                 (root / 'cache.json').write_text(json.dumps({
-                    'ГБОУ г. Москвы «Школа № 1» Москва': {'status': 'OK', 'candidates': [cached]}
+                    'ГБОУ г. Москвы «Школа № 1» Москва': {'status': 'OK', 'candidates': [cached]},
+                    '123': {'status': 'OK', 'candidates': [cached]},
                 }), encoding='utf-8')
-                app = Application(root / 'runs', root / 'registry', root / 'cache.json')
+                class Client:
+                    def suggest(self, query):
+                        return []
+                app = Application(root / 'runs', root / 'registry', root / 'cache.json',
+                                  client_factory=lambda token: Client())
                 app.jobs['configured'] = {'status': 'running'}
                 class Registry:
                     metadata = {}
@@ -123,7 +134,7 @@ class UploadTests(unittest.TestCase):
                     def search(self, record):
                         return [{**cached, 'source': 'Реестр аккредитации'}], False
                 with patch('ou_processor.web.ROOT', root), patch('ou_processor.workflow.RegistrySearch', Registry):
-                    app.run('configured', unpack_uploads([school_upload()]))
+                    app.run('configured', unpack_uploads([school_upload()]), token='test-key')
                 job = app.snapshot('configured')
                 self.assertEqual(job['status'], 'done', job.get('error'))
                 self.assertEqual(job['summary']['schools'], school_count)
@@ -139,7 +150,7 @@ class UploadTests(unittest.TestCase):
                 raise AssertionError('Обычная обработка не вызывает DaData')
         with tempfile.TemporaryDirectory() as root:
             app = Application(Path(root)/'runs', Path(root)/'registry', Path(root)/'cache.json',
-                              token='test-key', client_factory=EmptyClient)
+                              client_factory=EmptyClient)
             job_id = app.start({'files':[school_upload()]})
             for _ in range(500):
                 if app.snapshot(job_id)['status'] != 'running':
@@ -164,7 +175,7 @@ class UploadTests(unittest.TestCase):
             store = Store()
             app = Application(root, root, Path(root)/'cache.json', token_store=store)
             with patch.object(app, 'run'):
-                app.start({'files':[upload()], 'mode':'dadata_check', 'token':'private-test-key', 'save_token':True})
+                app.start({'files':[upload()], 'token':'private-test-key', 'save_token':True})
             self.assertEqual(store.value, 'private-test-key')
             self.assertNotIn('private-test-key', json.dumps(app.settings()))
             reopened = Application(root, root, Path(root)/'cache.json', token_store=store)
@@ -212,7 +223,7 @@ class UploadTests(unittest.TestCase):
 
     def test_cancel_stops_worker_and_removes_uploaded_file(self):
         entered, release = threading.Event(), threading.Event()
-        def paused_read(paths, should_cancel, sheet_names):
+        def paused_read(paths, should_cancel, sheet_names, config=None):
             entered.set()
             release.wait(5)
             should_cancel()

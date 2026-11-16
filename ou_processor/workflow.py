@@ -1,6 +1,5 @@
-"""Общий сценарий UI и CLI: реестры и отдельная диагностическая сверка DaData."""
+"""Общий сценарий UI и CLI: каскад официального реестра и DaData."""
 
-from copy import deepcopy
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -9,75 +8,62 @@ import sqlite3
 from .resolution import LicenseSearch, RegistrySearch, SearchCache, resolve
 
 
+class _AvailableIndex:
+    """Ошибка одного индекса не отменяет уже найденные группы."""
+    def __init__(self, index, warnings, name):
+        self.index, self.warnings, self.name = index, warnings, name
+        self.metadata = index.metadata
+        self.failed = False
+
+    def search(self, record):
+        if self.failed:
+            return [], False
+        try:
+            return self.index.search(record)
+        except sqlite3.Error:
+            self.failed = True
+            self.warnings.append(f'Не удалось прочитать индекс {self.name}; продолжен поиск в остальных источниках.')
+            return [], False
+
+
 def search(result, registry_path, config, *, licenses_path=None, cache=None, client=None,
            on_progress=None, check_cancel=None):
-    registry = None
-    licenses = None
-    warnings = []
-    result['processing_mode'] = 'dadata_check' if client is not None else 'registry'
-    total = len(result['groups']) * (2 if client is not None else 1)
+    warnings, opened = [], []
+    registry = licenses = None
+    result['processing_mode'] = 'cascade' if client is not None else 'registry'
 
-    def report(offset):
-        return lambda done, _: on_progress(done + offset, total) if on_progress else None
+    def open_index(factory, path, label):
+        try:
+            index = factory(path, config=config)
+            opened.append(index)
+            return _AvailableIndex(index, warnings, label)
+        except (ValueError, OSError, KeyError, sqlite3.Error):
+            warnings.append(f'Локальный реестр недоступен: {label}. Обновите снимок реестра.')
+            return None
 
     try:
         if licenses_path is not None:
-            try:
-                licenses = LicenseSearch(licenses_path, config=config)
-            except (ValueError, OSError, KeyError, sqlite3.Error):
-                warnings.append('Реестр лицензий недоступен. Запустите: python -m ou_processor.license_registry update. Используется резервный реестр аккредитации.')
-        try:
-            registry = RegistrySearch(registry_path, config=config)
-        except (ValueError, OSError, KeyError, sqlite3.Error):
-            warnings.append('Локальный реестр недоступен (резервный реестр аккредитации). Основной поиск по лицензиям продолжается; автоматического обращения к DaData нет.')
-        try:
-            resolve(result, None, registry, progress=False, config=config, licenses=licenses,
-                    on_progress=report(0), check_cancel=check_cancel)
-        except sqlite3.Error:
-            try:
-                resolve(result, None, None, progress=False, config=config, licenses=licenses,
-                        on_progress=report(0), check_cancel=check_cancel)
-            except sqlite3.Error:
-                warnings.append('Не удалось прочитать индекс реестра лицензий. Проверяем резервный реестр аккредитации.')
-                try:
-                    resolve(result, None, registry, progress=False, config=config,
-                            on_progress=report(0), check_cancel=check_cancel)
-                except sqlite3.Error:
-                    warnings.append('Не удалось прочитать индекс резервного реестра. Учреждения переданы на проверку; обновите локальные реестры.')
-                    resolve(result, None, None, progress=False, config=config,
-                            on_progress=report(0), check_cancel=check_cancel)
-            else:
-                warnings.append('Не удалось прочитать индекс резервного реестра. Сопоставления по лицензиям сохранены.')
-    finally:
-        if licenses is not None:
-            licenses.connection.close()
-        if registry is not None:
-            registry.connection.close()
-
-    if client is not None:
-        # Сверка не меняет выбранный реестром ИНН и не подтверждает новые случаи.
-        diagnostic = {'records': deepcopy(result['records']), 'groups': deepcopy(result['groups'])}
-        api = SearchCache(cache, client)
-        resolve(diagnostic, api, None, progress=False, config=config,
-                on_progress=report(len(result['groups'])), check_cancel=check_cancel)
-        checks = []
-        for primary, checked in zip(result['resolution']['groups'], diagnostic['resolution']['groups']):
-            original = primary['selected']
-            suggested = checked['selected']
-            original_inn = original['candidate_inn'] if original else ''
-            suggested_inn = suggested['candidate_inn'] if suggested else ''
-            status = ('СОВПАДАЕТ' if original_inn == suggested_inn else 'КОНФЛИКТ_ИНН') if original_inn and suggested_inn else 'ТРЕБУЕТ_ПРОВЕРКИ'
-            checks.append({'group_id': primary['group_id'], 'registry_inn': original_inn,
-                           'dadata_inn': suggested_inn, 'status': status})
-        result['dadata_checks'] = checks
-        result['dadata_candidates'] = diagnostic['resolution']['candidates']
-        result['resolution']['requests'] = api.requests
-        result['resolution']['actual_requests'] = api.actual_requests
-        if any(check['status'] == 'КОНФЛИКТ_ИНН' for check in checks):
-            warnings.append('Сверка DaData выявила конфликт ИНН. Итог реестра сохранён; расхождения требуют ручного решения.')
-        errors = sorted({r['status'] for r in api.requests if r['status'] != 'OK'})
+            licenses = open_index(LicenseSearch, licenses_path, 'реестра лицензий')
+        # Резерв первого семестра доступен явно, но не входит в стандартный каскад ТЗ v2.
+        if config.get('allow_accreditation_fallback', False):
+            registry = open_index(RegistrySearch, registry_path, 'резервного реестра аккредитации')
+        api = SearchCache(cache, client) if client is not None else None
+        if api is not None:
+            api.max_requests = config.get('dadata_max_requests', 10000)
+            if getattr(api, 'warning', ''):
+                warnings.append(api.warning)
+        resolve(result, api, registry, progress=False, config=config, licenses=licenses,
+                on_progress=on_progress, check_cancel=check_cancel)
+        if client is None:
+            warnings.append('Ключ DaData не настроен: проверка ограничена локальными источниками; адрес и юридический статус не уточнены через DaData.')
+        elif any(g['decision_reason'] == 'КОНФЛИКТ_ИНН' for g in result['resolution']['groups']):
+            warnings.append('Конфликт ИНН между источниками: автоматический выбор отменён, требуется ручная проверка.')
+        errors = sorted({r['status'] for r in result['resolution']['requests'] if r['status'] != 'OK'})
         if errors:
-            warnings.append('Сверка DaData выполнена не полностью: ' + ', '.join(errors))
+            warnings.append('DaData выполнен не полностью: ' + ', '.join(errors))
+    finally:
+        for index in opened:
+            index.connection.close()
     result['warnings'] = warnings
     return result
 
@@ -92,7 +78,7 @@ def write_log(result, destination):
         selected = group['selected'] or {}
         groups.append({
             'group_id': group['group_id'], 'record_ids': group['record_ids'],
-            'status': group['status'], 'selected_inn': selected.get('candidate_inn', ''),
+            'status': group['status'], 'decision_reason': group.get('decision_reason', ''), 'selected_inn': selected.get('candidate_inn', ''),
             'source': selected.get('source', ''), 'source_url': selected.get('source_url', ''),
             'score': selected.get('score'), 'license_used': group.get('license_used', False),
             'license_truncated': group.get('license_truncated', False),

@@ -7,12 +7,15 @@ function setBusy(value) { busy = value; $('controls').disabled = value; updateBu
 function updateButton() {
   $('start').disabled = busy || !files.length || !config;
   $('check-dadata').disabled = busy || !files.length || !config;
-  $('start').firstChild.textContent = !files.length ? 'Сначала загрузите Excel ' : 'Обработать таблицы ';
+  $('start').firstChild.textContent = !files.length ? 'Сначала загрузите Excel ' : 'Обработать по ТЗ ';
 }
 function updateConnection() {
-  $('connection').textContent = $('token').value.trim() ? 'Ключ для отдельной сверки введён'
+  $('connection').textContent = $('token').value.trim() ? 'Ключ для каскада введён'
     : config?.token_saved ? 'Ключ сохранён в системе'
-    : config?.token_configured ? 'Ключ для сверки задан на сервере' : 'Для обычной обработки ключ не нужен';
+    : config?.token_configured ? 'Ключ для каскада задан на сервере' : 'Без ключа: только локальные источники';
+  $('cascade-note').textContent = $('token').value.trim() || config?.token_configured
+    ? 'DaData автоматически уточнит реквизиты по ИНН или предложит кандидатов для ручной проверки. ФИО и номера дел остаются на компьютере.'
+    : 'Без ключа DaData проверка ограничена локальными источниками. Неразрешённые случаи попадут на ручную проверку.';
 }
 $('token').addEventListener('input', updateConnection);
 async function addFiles(incoming) {
@@ -94,10 +97,10 @@ $('form').onsubmit = async e => {
   try {
     const encoded = await Promise.all(files.map(encodeFile));
     const selected = files.map(file => sheets.get(file)?.selected || '');
-    const payload = {files:encoded, sheets:selected, mode:checking ? 'dadata_check' : 'registry'};
-    if (checking) Object.assign(payload, {token:$('token').value, save_token:$('save-token').checked});
+    const payload = {files:encoded, sheets:selected, mode:checking ? 'dadata_check' : 'cascade',
+      token:$('token').value, save_token:$('save-token').checked};
     const job = await request('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf}, body:JSON.stringify(payload)});
-    if (checking && $('token').value.trim()) { config.token_configured = true; config.token_saved ||= $('save-token').checked; }
+    if ($('token').value.trim()) { config.token_configured = true; config.token_saved ||= $('save-token').checked; }
     $('token').value = ''; updateConnection(); updateTokenNote(); currentJob = job.id; sessionStorage.setItem('schools-job', currentJob); poll();
   } catch (error) { showError(error.message); $('progress-card').hidden = true; $('cancel').hidden = true; setBusy(false); }
 };

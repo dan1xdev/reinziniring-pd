@@ -44,21 +44,22 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.json"
 MAX_ARCHIVE_BYTES = 2 * 1024 ** 3
 SNAPSHOT_PATTERN = r"snapshot-\d{8}-[0-9a-f]{16}"
 DATA_FILE = "source.data"
+INDEX_SCHEMA_VERSION = 2
 
 # Названия полей различаются между версиями выгрузки, поэтому поля
 # распознаются по известным вариантам имени тега XML или заголовка колонки.
 FIELD_SYNONYMS = {
-    "full_name": ("fullname", "полноенаименование", "eduorgfullname", "наименование"),
+    "full_name": ("schoolname", "fullname", "полноенаименование", "eduorgfullname", "наименование"),
     "short_name": ("shortname", "краткоенаименование", "eduorgshortname"),
     "inn": ("inn", "инн", "eduorginn"),
     "ogrn": ("ogrn", "огрн", "eduorgogrn"),
     "kpp": ("kpp", "кпп", "eduorgkpp"),
     "license_number": ("licenseregnumber", "licensenumber", "регномер", "номерлицензии",
-                       "реестровыйномер", "regnumber"),
+                       "реестровыйномер", "regnumber", "regnum"),
     "status": ("statusname", "статуслицензии", "статус", "status"),
-    "date_start": ("datestart", "датаначала", "dateresolution", "датарешения", "date", "дата"),
+    "date_start": ("datelicdoc", "datestart", "датаначала", "dateresolution", "датарешения", "date", "дата"),
     "region": ("regionname", "субъектрф", "регион", "region"),
-    "address": ("postaddress", "юридическийадрес", "eduorgaddress", "адрес", "address"),
+    "address": ("lawaddress", "postaddress", "юридическийадрес", "eduorgaddress", "адрес", "address"),
 }
 
 
@@ -107,7 +108,7 @@ def current_snapshot(cache):
 
 def field_key(tag):
     """Сопоставляет тег XML или заголовок колонки с полем индекса."""
-    key = re.sub(r"[^0-9a-zа-яё]", "", str(tag).casefold())
+    key = re.sub(r"[^0-9a-zа-яё]", "", str(tag).rsplit("}", 1)[-1].casefold())
     for field, variants in FIELD_SYNONYMS.items():
         if key in variants:
             return field
@@ -128,29 +129,47 @@ def field_key(tag):
     return ""
 
 
+def xml_tag(element):
+    return element.tag.rsplit("}", 1)[-1].casefold()
+
+
 def records_from_xml(stream):
-    """Выдаёт записи выгрузки из XML. Запись — элемент, у которого все
-    вложенные элементы простые (текстовые) и их не меньше трёх."""
+    """Читает одну лицензию целиком, освобождая её дерево после выдачи записи."""
     stack = []
     for event, element in iterparse(stream, events=("start", "end"), forbid_dtd=True,
                                     forbid_entities=True, forbid_external=True):
         if event == "start":
             stack.append(element)
             continue
-        stack.pop()
-        if len(element) < 3 or any(len(child) for child in element):
-            continue
-        fields = {}
-        for child in element:
-            value = (child.text or "").strip()
-            key = field_key(child.tag)
-            if key and value and key not in fields:
-                fields[key] = value
-        if stack:
-            stack[-1].remove(element)
-        element.clear()
-        if fields.get("full_name") or fields.get("inn") or fields.get("license_number"):
+        # Поля приложения и программы не заменяют реквизиты самой лицензии.
+        is_license = (xml_tag(element) == "license" and len(stack) >= 2
+                      and xml_tag(stack[-2]) == "licenses")
+        if is_license:
+            fields = {}
+            for child in element:
+                key = field_key(child.tag)
+                value = (child.text or "").strip() if not len(child) else ""
+                if key and value and key not in fields:
+                    fields[key] = value
+            levels = set()
+            for supplements in element:
+                if xml_tag(supplements) != "supplements":
+                    continue
+                for supplement in supplements:
+                    if xml_tag(supplement) != "supplement":
+                        continue
+                    for programs in supplement:
+                        if xml_tag(programs) != "licensedprograms":
+                            continue
+                        for program in programs:
+                            if xml_tag(program) == "licensedprogram":
+                                levels.update((level.text or "").strip() for level in program
+                                              if xml_tag(level) == "edulevelname" and (level.text or "").strip())
+            fields["education_levels"] = sorted(levels)
+            stack[-2].remove(element)
+            element.clear()
             yield fields
+        stack.pop()
 
 
 def records_from_csv(stream):
@@ -229,38 +248,71 @@ def records_from_export(path, format_hint=""):
         yield from reader(stream)
 
 
+def region_matcher():
+    """Использует только явный субъект в адресе; неоднозначный адрес не угадывает."""
+    config = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    aliases = {}
+    for region, variants in config.get("regions", {}).items():
+        for variant in [region, *variants]:
+            aliases.setdefault(normalize(variant), set()).add(region)
+    pattern = re.compile(r"(?<!\w)(?:" + "|".join(
+        re.escape(alias) for alias in sorted(aliases, key=len, reverse=True)) + r")(?!\w)")
+
+    def match(address):
+        found = set()
+        for result in pattern.finditer(normalize(address)):
+            found.update(aliases[result.group()])
+        return next(iter(found)) if len(found) == 1 else ""
+    return match
+
+
+def normalized_license_date(value):
+    for format_string in ("%d.%m.%Y", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(value, format_string).date().isoformat()
+        except ValueError:
+            continue
+    return value
+
+
 def build_index(source_path, database_path, format_hint=""):
-    """Собирает SQLite-индекс лицензий из официальной выгрузки."""
+    """Собирает проверенный индекс; неполные исходные записи учитывает отдельно."""
     connection = sqlite3.connect(database_path)
-    records = 0
+    records = rejected = 0
+    match_region = region_matcher()
     try:
         connection.execute("""CREATE TABLE licenses (
             inn TEXT, ogrn TEXT, kpp TEXT, full_name TEXT, short_name TEXT,
             license_number TEXT, date_start TEXT, status TEXT, region TEXT,
-            address TEXT, search_name TEXT)""")
+            address TEXT, search_name TEXT, education_levels TEXT)""")
         for fields in records_from_export(source_path, format_hint):
-            full_name = fields.get("full_name", "")
-            if not full_name and not fields.get("inn"):
+            if any(not fields.get(key) for key in ("full_name", "inn", "license_number")):
+                rejected += 1
                 continue
-            connection.execute("INSERT INTO licenses VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (fields.get("inn", ""), fields.get("ogrn", ""), fields.get("kpp", ""),
-                 full_name, fields.get("short_name", ""), fields.get("license_number", ""),
-                 fields.get("date_start", ""), fields.get("status", ""),
-                 fields.get("region", ""), fields.get("address", ""),
-                 normalize(full_name + " " + fields.get("short_name", ""))))
+            full_name = fields["full_name"]
+            address = fields.get("address", "")
+            connection.execute("INSERT INTO licenses VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (fields["inn"], fields.get("ogrn", ""), fields.get("kpp", ""),
+                 full_name, fields.get("short_name", ""), fields["license_number"],
+                 normalized_license_date(fields.get("date_start", "")), fields.get("status", ""),
+                 fields.get("region") or match_region(address), address,
+                 normalize(full_name + " " + fields.get("short_name", "")),
+                 json.dumps(fields.get("education_levels", []), ensure_ascii=False)))
             records += 1
             if records % 10000 == 0:
                 connection.commit()
                 print(f"Прочитано {records} записей", file=sys.stderr, flush=True)
         if not records:
-            raise ValueError("В выгрузке не найдено ни одной записи о лицензии")
+            raise ValueError("В выгрузке нет лицензий с обязательными полями: название, ИНН, номер лицензии")
         connection.execute("CREATE INDEX inn_idx ON licenses(inn)")
+        connection.execute(f"PRAGMA user_version = {INDEX_SCHEMA_VERSION}")
         connection.commit()
         if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise ValueError("Индекс SQLite не прошел проверку")
     finally:
         connection.close()
-    return {"records": records}
+    return {"records": records, "rejected_records": rejected,
+            "index_schema_version": INDEX_SCHEMA_VERSION}
 
 
 def load_settings(config_path=DEFAULT_CONFIG):
@@ -413,8 +465,9 @@ def update(cache, keep=None, force=False, opener=urlopen, settings=None):
     with cache_lock(cache):
         try:
             current = current_snapshot(cache)
+            rebuild = bool(current and current[1].get("index_schema_version") != INDEX_SCHEMA_VERSION)
             # 1. По настройкам свежий снимок можно не проверять в сети.
-            if current and not force and update_days:
+            if current and not rebuild and not force and update_days:
                 try:
                     downloaded = datetime.fromisoformat(current[1]["downloaded_at"])
                 except (KeyError, ValueError):
@@ -424,10 +477,13 @@ def update(cache, keep=None, force=False, opener=urlopen, settings=None):
                               "update_days": update_days, "manifest": current[1]}
                     write_json_atomic(cache / "last_check.json", report)
                     return report
-            source = resolve_source(settings, opener)
+            # Старый индекс можно исправить без сети из проверенного сохранённого файла.
+            source = ({"file": str(current[0] / DATA_FILE)} if rebuild
+                      else resolve_source(settings, opener))
             is_local = "file" in source
             url = source.get("file", source.get("url", ""))
-            source_format = Path(urlsplit(url).path).suffix.lower().lstrip(".")
+            original_url = current[1]["source_url"] if rebuild else url
+            source_format = Path(urlsplit(original_url).path).suffix.lower().lstrip(".")
             remote = {} if is_local else remote_metadata(source["url"], opener)
             if current and not force and not is_local and unchanged(remote, current[1]) \
                     and current[1].get("source_url") == source["url"]:
@@ -446,22 +502,31 @@ def update(cache, keep=None, force=False, opener=urlopen, settings=None):
                                                               "Accept-Encoding": "identity"})
                     with opener(request, timeout=120) as response:
                         headers, size, digest = _save_archive(response, directory / DATA_FILE)
-                if current and digest == current[1]["sha256"]:
+                if rebuild:
+                    if digest != current[1]["sha256"]:
+                        raise ValueError("Контрольная сумма сохранённой выгрузки не совпала")
+                    url = current[1]["source_url"]
+                    headers = {"ETag": current[1].get("etag", ""),
+                               "Last-Modified": current[1].get("last_modified", "")}
+                if current and not rebuild and digest == current[1]["sha256"]:
                     report = {"status": "unchanged", "checked_at": utc_now(), "snapshot": current[0].name,
                               "source_url": url, "manifest": current[1], "verified_download": True}
                     write_json_atomic(cache / "last_check.json", report)
                     return report
                 details = build_index(directory / DATA_FILE, directory / "index.sqlite", source_format)
                 date_match = re.search(r"data-(\d{8})-", url)
-                snapshot_date = date_match.group(1) if date_match else time.strftime("%Y%m%d")
+                snapshot_date = (current[1]["snapshot_date"] if rebuild else
+                                 date_match.group(1) if date_match else time.strftime("%Y%m%d"))
                 metadata = {"source_kind": "license_registry",
                             "source_page": str(settings.get("source_page", "") or SOURCE_PAGE),
-                            "source_url": url, "snapshot_date": snapshot_date, "downloaded_at": utc_now(),
+                            "source_url": url, "snapshot_date": snapshot_date,
+                            "downloaded_at": current[1]["downloaded_at"] if rebuild else utc_now(),
                             "archive_bytes": size, "sha256": digest,
                             "etag": header(headers, "ETag"), "last_modified": header(headers, "Last-Modified"),
                             **details}
                 write_json_atomic(directory / "manifest.json", metadata)
-                name = f"snapshot-{snapshot_date}-{digest[:16]}"
+                identity = hashlib.sha256(f"{digest}:v{INDEX_SCHEMA_VERSION}".encode()).hexdigest()[:16]
+                name = f"snapshot-{snapshot_date}-{identity}"
                 destination = cache / name
                 if destination.exists():
                     raise ValueError("Такой снимок уже существует; сохраненная версия не перезаписана")
@@ -512,6 +577,7 @@ def lookup(cache, inn=None, name=None, limit=20):
         rows = [dict(row) for row in db.execute(sql, [*params, limit + 1])]
     for row in rows:
         row.pop("search_name", None)
+        row["education_levels"] = json.loads(row.get("education_levels") or "[]")
     return {"source_kind": "license_registry", "snapshot_date": snapshot[1]["snapshot_date"],
             "source_url": snapshot[1].get("source_url", ""),
             "matches": rows[:limit]}

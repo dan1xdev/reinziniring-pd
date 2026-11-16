@@ -79,6 +79,7 @@ class Application:
                  token_store=None, registry_worker=None, licenses=None, licenses_worker=None):
         self.storage, self.registry, self.cache = Path(storage), Path(registry), Path(cache)
         self.licenses = Path(licenses) if licenses else ROOT.parent / 'license_registry_cache'
+        token = token or os.environ.get('DADATA_API_KEY', '')
         self.initial_token = token
         self.token, self.client_factory = token, client_factory
         self.token_store = token_store
@@ -148,9 +149,9 @@ class Application:
         if not isinstance(payload, dict):
             raise UserError('Некорректные параметры загрузки.')
         supplied = unpack_uploads(payload.get('files'), deduplicate=False)
-        mode = payload.get('mode', 'registry')
-        if not isinstance(mode, str) or mode not in {'registry', 'dadata_check'}:
-            raise UserError('Выберите обработку по реестру или отдельную сверку DaData.')
+        mode = payload.get('mode', 'cascade')
+        if not isinstance(mode, str) or mode not in {'cascade', 'registry', 'dadata_check'}:
+            raise UserError('Выберите обработку по ТЗ или обработку с обязательным ключом DaData.')
         sheets = payload.get('sheets', [''] * len(supplied))
         if (not isinstance(sheets, list) or len(sheets) != len(supplied)
                 or any(not isinstance(value, str) or len(value) > 31 for value in sheets)):
@@ -163,16 +164,16 @@ class Application:
             seen.add(key)
             uploaded.append((name, content))
             selected_sheets.append(sheet)
-        token = (payload.get('token') or self.token) if mode == 'dadata_check' else ''
+        token = payload.get('token') or self.token
         if not isinstance(token, str) or len(token) > 256 or '\n' in token or '\r' in token:
             raise UserError('Проверьте API-ключ DaData.')
         token = token.strip()
         if mode == 'dadata_check' and not token:
-            raise UserError('Для отдельной сверки введите API-ключ DaData. Обычная обработка по реестру работает без ключа.')
+            raise UserError('Введите API-ключ DaData. Без ключа можно запустить обработку по локальным источникам.')
         with self.lock:
             if self.active:
                 raise UserError('Уже идёт обработка. Дождитесь её завершения.')
-            if mode == 'dadata_check' and payload.get('save_token') is True and payload.get('token'):
+            if token and payload.get('save_token') is True and payload.get('token'):
                 if not self.token_store:
                     raise UserError('Системное хранилище ключей недоступно. Снимите флажок сохранения ключа.')
                 try:
@@ -180,8 +181,7 @@ class Application:
                 except Exception:
                     raise UserError('Не удалось сохранить ключ. Проверьте доступ к системному хранилищу или снимите флажок сохранения.') from None
                 self.token_saved = True
-            if mode == 'dadata_check':
-                self.token = token
+            self.token = token
             job_id = secrets.token_hex(16)
             self.jobs[job_id] = {'id': job_id, 'status': 'running', 'phase': 'Читаем Excel',
                                  'progress': 2, 'done': 0, 'total': 0, 'error': ''}
@@ -230,7 +230,7 @@ class Application:
                 raise JobCancelled()
             self.jobs[job_id].update(status='done', phase='Готово', progress=100, **fields)
 
-    def run(self, job_id, uploaded, token='', mode='registry', sheets=None):
+    def run(self, job_id, uploaded, token='', mode='cascade', sheets=None):
         was_cancelled = False
         directory = self.storage / job_id
         try:
@@ -246,16 +246,16 @@ class Application:
                 paths.append(path)
                 sheet_names[str(path.resolve())] = sheets[index] if sheets else ''
             config = json.loads((ROOT / 'config.json').read_text())
-            records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id), sheet_names=sheet_names)
+            records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id), sheet_names=sheet_names, config=config)
             self.check_cancel(job_id)
             if len(records) > 5000:
                 raise UserError('В прототипе можно обработать до 5 000 строк за запуск. Разделите таблицу.')
             result = process(records, config)
             self.check_cancel(job_id)
             result.update(sources=sources, created_at_utc=datetime.now(timezone.utc).isoformat())
-            phase = 'Ищем в реестрах и отдельно сверяем DaData' if mode == 'dadata_check' else 'Ищем организации в локальных реестрах'
+            phase = 'Обрабатываем по ТЗ: реестры и DaData' if token else 'Ищем организации в локальных источниках без DaData'
             self.change(job_id, phase=phase, progress=8, total=len(result['groups']))
-            client = self.client_factory(token) if mode == 'dadata_check' else None
+            client = self.client_factory(token) if token else None
             search(result, self.registry, config, licenses_path=self.licenses,
                 cache=self.cache, client=client,
                 on_progress=lambda done, total: self.progress(job_id, done, total),
@@ -454,7 +454,9 @@ def main():
     except OSError:
         parser.exit(1, 'Порт занят. Закройте старый экземпляр или укажите другой --port.\n')
     server.app = app
-    app.start_registry_update()
+    config = json.loads((ROOT / 'config.json').read_text(encoding='utf-8'))
+    if config.get('allow_accreditation_fallback', False):
+        app.start_registry_update()
     app.start_licenses_update()
     url = f'http://127.0.0.1:{server.server_port}'
     print(f'Откройте {url}. Для остановки нажмите Ctrl+C.', flush=True)

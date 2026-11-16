@@ -49,7 +49,7 @@ class PersonalFileTests(unittest.TestCase):
             source = Path(tmp) / "source.xlsx"
             workbook = Workbook()
             sheet = workbook.active
-            sheet.append(["Образовательное учреждение", "Вид образования", "Личное дело.Номер"])
+            sheet.append(["Образовательное учреждение", "Вид образования", "Личное дело.Номер", "ФИО"])
             sheet.append(["ГБОУ города Москвы Школа № 1", "Среднее общее", 12])
             sheet["C2"].number_format = "00000"
             sheet.append(["ГБОУ города Москвы Школа № 1", "Среднее общее", "00013"])
