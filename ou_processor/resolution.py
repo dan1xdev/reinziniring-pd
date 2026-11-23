@@ -9,6 +9,7 @@ import sqlite3
 import time
 
 from .dadata import DaDataError, candidate_row
+from .letters import valid_inn
 from .license_registry import SOURCE_PAGE as LICENSE_SOURCE_PAGE
 from .license_registry import current_snapshot as current_license_snapshot
 from .normalization import expanded_key, institution_type, normalize, numbers
@@ -167,7 +168,8 @@ def inn_matches(source, candidate):
     source, candidate = str(source or '').strip(), str(candidate or '').strip()
     return bool(source and candidate) and (source == candidate or
         source.isascii() and candidate.isascii() and source.isdecimal() and candidate.isdecimal()
-        and source.lstrip('0') == candidate.lstrip('0'))
+        and len(source) < len(candidate) and valid_inn(candidate)
+        and source.zfill(len(candidate)) == candidate)
 
 
 def assess(record, candidate, config=None):
@@ -315,6 +317,8 @@ def assess(record, candidate, config=None):
                 raw_score += weights.get("institution_type_match", 15.0)
             else:
                 raw_score -= penalties.get("type_mismatch", 35.0)
+        if source_kind and source_kind == target_kind:
+            raw_score += weights.get("school_kind_match", 10.0)
 
         # 5. Город
         if record['city']:
@@ -382,6 +386,17 @@ def choose(record, candidates, config=None):
                         c['reasons'].append('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ')
                     c['eligible'] = False
             eligible_inns = {c['candidate_inn'] for c in ranked if c['eligible']}
+
+    # Одинаковое официальное имя у разных ИНН требует проверки правопреемства.
+    exact_name = normalize(record['name'])
+    same_name = [c for c in ranked if c['candidate_inn'] and
+                 normalize(c['candidate_name']) == exact_name]
+    if len({c['candidate_inn'] for c in same_name}) > 1:
+        for c in ranked:
+            if c['eligible'] or c in same_name:
+                c['reasons'].append('НЕОДНОЗНАЧНЫЙ_ИНН_ПРИ_СОВПАДЕНИИ_НАЗВАНИЯ')
+                c['eligible'] = False
+        eligible_inns.clear()
 
     if len(eligible_inns) == 1:
         selected = next((c for c in ranked if c['eligible']), None)

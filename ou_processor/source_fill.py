@@ -14,6 +14,7 @@ from openpyxl.utils import get_column_letter, coordinate_to_tuple, range_boundar
 
 from .normalization import normalize
 from .letters import valid_inn
+from .resolution import inn_matches
 
 
 TARGET_FIELDS = {
@@ -33,21 +34,19 @@ TARGET_FIELDS = {
         ),
     },
     "address": {
-        "header": "Адрес",
+        "header": "Полный адрес ОУ",
         "aliases": (
             "Полный адрес ОУ",
             "Адрес ОУ",
             "Адрес школы",
             "Адрес образовательного учреждения",
             "Юридический адрес",
-            "Адрес",
         ),
     },
     "postal_code": {
-        "header": "Индекс",
+        "header": "Индекс ОУ",
         "aliases": (
             "Индекс ОУ",
-            "Индекс",
             "Почтовый индекс",
         ),
     },
@@ -449,8 +448,10 @@ def fill_source_copies(result, output):
                     if value:
                         existing = str(cell.value).strip() if cell.value is not None else ""
                         if existing:
-                            same_inn = (existing.isascii() and existing.isdecimal()
-                                        and existing.lstrip("0") == value.lstrip("0"))
+                            same_inn = (field == "inn" and cell.data_type == "n"
+                                        and isinstance(cell.value, (int, float))
+                                        and float(cell.value).is_integer()
+                                        and inn_matches(str(int(cell.value)), value))
                             if field != "inn" or not same_inn or (existing == value and cell.data_type == "s"):
                                 field_present[field] += 1
                                 continue
