@@ -53,6 +53,18 @@ def school_numbers(name):
     return tuple(sorted(set(re.findall(r'\b(?:школа|сош|лицей|гимназия|колледж|техникум)\s+(\d+)\b', normalize(name)))))
 
 
+def school_kind(name):
+    value = normalize(name)
+    if re.search(r'\bдошкольн\w*\b|\bдетск\w*\s+сад\w*\b', value):
+        return 'ДОШКОЛЬНОЕ'
+    for kind, pattern in (('ГИМНАЗИЯ', r'\bгимнази\w*\b'),
+                          ('ЛИЦЕЙ', r'\bлице\w*\b'),
+                          ('ШКОЛА', r'\b(?:школ\w*|сош|сш|оош)\b')):
+        if re.search(pattern, value):
+            return kind
+    return ''
+
+
 def meaningful(record, config=None):
     words = terms(record['name'], config)
 
@@ -151,8 +163,16 @@ def geography_matches(expected, candidate):
     return bool(tokens) and tokens <= actual
 
 
+def inn_matches(source, candidate):
+    source, candidate = str(source or '').strip(), str(candidate or '').strip()
+    return bool(source and candidate) and (source == candidate or
+        source.isascii() and candidate.isascii() and source.isdecimal() and candidate.isdecimal()
+        and source.lstrip('0') == candidate.lstrip('0'))
+
+
 def assess(record, candidate, config=None):
     candidate = {key: '' if value is None else value for key, value in candidate.items()}
+    candidate['candidate_inn'] = str(candidate.get('candidate_inn') or '').strip()
     cfg = config or _DEFAULT_CONFIG
     scoring_cfg = cfg.get("scoring", {})
     weights = scoring_cfg.get("weights", {
@@ -195,6 +215,11 @@ def assess(record, candidate, config=None):
     target_type = institution_type(name, cfg)
     if source_type and target_type and source_type != target_type:
         reasons.append('ТИП_НЕ_СОВПАЛ')
+    source_kind = school_kind(record['name'])
+    target_kind = school_kind(name)
+    if source_type == 'ШКОЛА' and (target_kind == 'ДОШКОЛЬНОЕ' or
+                                   source_kind and source_kind != target_kind):
+        reasons.append('ТИП_НЕ_СОВПАЛ')
 
     if source_type == 'ШКОЛА' and re.search(r'дополнительного образования|музыкальн|школа искусств|спортивн|художественн', normalize(name)):
         reasons.append('ДОПОЛНИТЕЛЬНОЕ_ОБРАЗОВАНИЕ_ВМЕСТО_ШКОЛЫ')
@@ -202,7 +227,7 @@ def assess(record, candidate, config=None):
     if re.search(r'профсоюз|местная общественная организация', normalize(name)):
         reasons.append('ОБЩЕСТВЕННАЯ_ОРГАНИЗАЦИЯ_ВМЕСТО_УЧРЕЖДЕНИЯ')
 
-    if record.get('inn_raw') and record['inn_raw'] != candidate['candidate_inn']:
+    if record.get('inn_raw') and not inn_matches(record['inn_raw'], candidate['candidate_inn']):
         reasons.append('ИНН_НЕ_СОВПАЛ')
     if not candidate['candidate_inn']:
         reasons.append('НЕТ_ИНН')
@@ -254,13 +279,16 @@ def assess(record, candidate, config=None):
     distinctive = bool(key) and overlap >= distinctive_thresh and (
         len(key) >= 2 or max(map(len, key)) >= 8 or
         bool(record['city']) and max(map(len, key)) >= 4)
-    exact_inn = bool(record.get('inn_raw') and record['inn_raw'] == candidate['candidate_inn'])
-    identity = exact_inn or numbered_city or distinctive
+    exact_inn = inn_matches(record.get('inn_raw'), candidate['candidate_inn'])
+    normalized_name = normalize(name)
+    exact_name = bool(normalized_name == normalize(record['name']) and re.search(
+        r'\b(?:учреждени\w*|организаци\w*)\b', normalized_name))
+    identity = exact_inn or exact_name or numbered_city or distinctive
     if not identity:
         reasons.append('НЕДОСТАТОЧНО_ПРИЗНАКОВ')
 
     # Расчёт баллов
-    if exact_inn and not reasons:
+    if (exact_inn or exact_name) and not reasons:
         score = 100.0
     else:
         raw_score = 0.0
@@ -337,7 +365,8 @@ def choose(record, candidates, config=None):
     best_by_inn = {}
     for c in ranked:
         inn = c.get('candidate_inn')
-        if inn:
+        # Несовместимое учреждение не создаёт ложную конкуренцию подходящему ИНН.
+        if inn and not c['reasons'] and c['score'] >= thresholds.get('auto_match_min_score', 90.0) - margin_threshold:
             if inn not in best_by_inn or c['score'] > best_by_inn[inn]['score']:
                 best_by_inn[inn] = c
 
@@ -348,8 +377,9 @@ def choose(record, candidates, config=None):
         if top1['score'] - top2['score'] < margin_threshold:
             # Неясность между лидерами запрещает выбирать и любого следующего кандидата.
             for c in ranked:
-                if c['eligible'] or c['candidate_inn'] in (top1['candidate_inn'], top2['candidate_inn']):
-                    c['reasons'].append('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ')
+                if c['eligible'] or c is top1 or c is top2:
+                    if 'НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ' not in c['reasons']:
+                        c['reasons'].append('НЕДОСТАТОЧНЫЙ_ОТРЫВ_КАНДИДАТОВ')
                     c['eligible'] = False
             eligible_inns = {c['candidate_inn'] for c in ranked if c['eligible']}
 

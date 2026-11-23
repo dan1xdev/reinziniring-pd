@@ -13,6 +13,7 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, coordinate_to_tuple, range_boundaries
 
 from .normalization import normalize
+from .letters import valid_inn
 
 
 TARGET_FIELDS = {
@@ -39,6 +40,7 @@ TARGET_FIELDS = {
             "Адрес школы",
             "Адрес образовательного учреждения",
             "Юридический адрес",
+            "Полный адрес ОУ",
         ),
     },
     "postal_code": {
@@ -46,7 +48,12 @@ TARGET_FIELDS = {
         "aliases": (
             "Индекс",
             "Почтовый индекс",
+            "Индекс ОУ",
         ),
+    },
+    "inn": {
+        "header": "ИНН ОУ (из реестра)",
+        "aliases": ("ИНН ОУ (из реестра)", "ИНН ОУ", "ИНН образовательного учреждения"),
     },
 }
 
@@ -92,6 +99,7 @@ def _letter_values(letter):
         "genitive_name": genitive_name,
         "address": address,
         "postal_code": postal_code,
+        "inn": str(letter.get("inn") or "").strip() if valid_inn(letter.get("inn")) else "",
     }
 
 
@@ -192,6 +200,8 @@ def _target_columns(sheet, header_row, updates):
                 break
 
         if found is None:
+            if field == "inn":
+                continue
             found = sheet.max_column + 1
             cell = sheet.cell(header_row, found, spec["header"])
             updates[cell.coordinate] = spec["header"]
@@ -437,8 +447,11 @@ def fill_source_copies(result, output):
                         continue
                     # Пустое или неподтверждённое значение не стирает исходные данные.
                     if value:
-                        if field == "address" and cell.value is not None and str(cell.value).strip():
-                            if normalize(cell.value) != normalize(value):
+                        existing = str(cell.value).strip() if cell.value is not None else ""
+                        if existing:
+                            same_inn = (existing.isascii() and existing.isdecimal()
+                                        and existing.lstrip("0") == value.lstrip("0"))
+                            if field != "inn" or not same_inn or (existing == value and cell.data_type == "s"):
                                 field_present[field] += 1
                                 continue
                         cell.value = value

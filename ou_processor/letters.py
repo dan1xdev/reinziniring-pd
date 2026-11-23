@@ -12,6 +12,7 @@ LETTER_COLUMNS = [
     ("address", "Адрес без индекса"),
     ("region", "Регион"),
     ("students", "Поступившие"),
+    ("files", "Номера личных дел"),
     ("student_count", "Количество поступивших"),
     ("match_status", "Статус сопоставления"),
     ("status", "Готовность"),
@@ -292,6 +293,10 @@ _GENITIVE_ADJECTIVES = {
     "общеобразовательная": "общеобразовательной",
     "специальная": "специальной",
     "коррекционная": "коррекционной",
+    "автономная": "автономной",
+    "некоммерческая": "некоммерческой",
+    "профессиональная": "профессиональной",
+    "образовательная": "образовательной",
 }
 
 _NOUNS = {
@@ -397,6 +402,7 @@ def _person_ok(name):
 
 
 def _students(students):
+    pairs = {}
     names = defaultdict(set)
     names_per_file = defaultdict(set)
     records = set()
@@ -419,6 +425,7 @@ def _students(students):
             )
 
         names[full].add(personal_file)
+        pairs.setdefault((_normalized(full), personal_file), full)
 
         if personal_file:
             names_per_file[personal_file].add(_normalized(full))
@@ -450,14 +457,14 @@ def _students(students):
         notes.append("Повтор ФИО без номера личного дела")
 
     ordered = sorted(
-        names,
+        pairs.items(),
         key=lambda name: (
-            name.casefold().replace("ё", "е"),
-            name,
+            name[1].casefold().replace("ё", "е"),
+            name[0][1],
         ),
     )
 
-    return ordered, sorted(records), sorted(set(notes))
+    return [{"name": full, "file": key[1]} for key, full in ordered], sorted(records), sorted(set(notes))
 
 
 def _preferred_candidates(groups):
@@ -594,6 +601,7 @@ def _prepare_one(inn, groups, students, override=None):
 
     people, source_ids, person_notes = _students(students)
     checks.extend(person_notes)
+    people_names = [person["name"] for person in people]
 
     if len(people) == 1:
         kind = "Для одного поступившего"
@@ -609,13 +617,13 @@ def _prepare_one(inn, groups, students, override=None):
             fragment = (
                 f"Благодарим коллектив {genitive} "
                 "за подготовку к поступлению.\n"
-                f"ФИО: {people[0]}."
+                f"ФИО: {people_names[0]}."
             )
         else:
             fragment = (
                 f"Благодарим коллектив {genitive} "
                 "за подготовку поступивших:\n"
-                + "\n".join(people)
+                + "\n".join(people_names)
                 + "."
             )
 
@@ -630,7 +638,8 @@ def _prepare_one(inn, groups, students, override=None):
         "inn": inn,
         "official_name": official_name,
         "genitive_name": genitive,
-        "students": ", ".join(people),
+        "students": ", ".join(people_names),
+        "files": "\n".join(person["file"] for person in people),
         "student_count": len(people),
         "postal_code": code,
         "address": address,

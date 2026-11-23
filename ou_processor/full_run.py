@@ -22,6 +22,7 @@ from .letters import (
     prepare_letters,
     postal_details,
     LETTER_COLUMNS,
+    valid_inn,
 )
 from .input import list_sheets, read_records
 from .manual_review import DEFAULT_STORE, apply_import, load_result, load_store, save_store, template_bytes
@@ -474,6 +475,7 @@ def _extend_task6_summary(result, source_fill):
         "genitive_name": "Название в родительном падеже",
         "address": "Адрес",
         "postal_code": "Индекс",
+        "inn": "ИНН",
     }
 
     summary["Дубли удалены до обработки"] = duplicate_count
@@ -519,7 +521,10 @@ def _extend_task6_summary(result, source_fill):
 
 
 def save(result, output, overrides=None):
-    prepare_letters(result, overrides=overrides)
+    form_overrides = {**result.get("form_overrides", {}), **(overrides or {})}
+    if form_overrides:
+        result["form_overrides"] = form_overrides
+    prepare_letters(result, overrides=form_overrides)
 
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -863,8 +868,10 @@ def save(result, output, overrides=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="*", type=Path)
-    parser.add_argument('--result', type=Path, help='result.json предыдущего запуска для импорта решений')
+    parser.add_argument('--result', type=Path, help='result.json предыдущего запуска для импорта решений или повторного сохранения')
     parser.add_argument('--import-decisions', type=Path, help='Заполненный шаблон manual_decisions.xlsx')
+    parser.add_argument('--confirm-form', nargs=3, action='append', metavar=('ИНН', 'ИМЕНИТЕЛЬНЫЙ', 'РОДИТЕЛЬНЫЙ'),
+                        help='Подтвердить оба названия для ИНН; можно повторить для нескольких школ')
     parser.add_argument('--decisions-store', type=Path, default=DEFAULT_STORE, help='Локальный справочник подтверждений')
     parser.add_argument(
         "--output",
@@ -897,10 +904,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.result or args.import_decisions:
-        if not args.result or not args.import_decisions or args.inputs or args.list_sheets or args.check_dadata or args.ask_token or args.sheet:
-            parser.error('Импорт: --result result.json --import-decisions решения.xlsx --output новая_папка; без входных книг и DaData')
+        if not args.result or args.inputs or args.list_sheets or args.check_dadata or args.ask_token or args.sheet:
+            parser.error('Повторное сохранение: --result result.json [--import-decisions решения.xlsx] --output новая_папка; без входных книг и DaData')
     elif not args.inputs:
-        parser.error('Укажите входные книги или --result и --import-decisions')
+        parser.error('Укажите входные книги или --result')
+    if args.list_sheets and args.confirm_form:
+        parser.error('--confirm-form требует обработки результата')
+
+    form_overrides = {}
+    for inn, official_name, genitive_name in args.confirm_form or []:
+        if not valid_inn(inn) or not official_name.strip() or not genitive_name.strip() or inn in form_overrides:
+            parser.error('--confirm-form требует уникальный действительный ИНН и оба непустых названия')
+        form_overrides[inn] = {"official_name": official_name, "genitive_name": genitive_name, "verified": True}
 
     if args.list_sheets:
         try:
@@ -924,7 +939,8 @@ def main(argv=None):
         decisions = load_store(args.decisions_store)
         if args.result:
             result = load_result(args.result)
-            result, decisions = apply_import(result, args.import_decisions.read_bytes(), decisions)
+            if args.import_decisions:
+                result, decisions = apply_import(result, args.import_decisions.read_bytes(), decisions)
         else:
             config = json.loads(args.config.read_text(encoding='utf-8'))
             records, sources = read_records(args.inputs, sheet_name=args.sheet, config=config)
@@ -941,8 +957,13 @@ def main(argv=None):
             search(result, args.registry, config, licenses_path=args.licenses,
                    cache=args.cache, client=client, on_progress=progress, manual_decisions=decisions)
         aggregate(result)
-        save(result, args.output)
-        if args.result:
+        selected_inns = {str(group['selected']['candidate_inn']) for group in result['resolution']['groups']
+                         if group.get('selected')}
+        unknown_inns = form_overrides.keys() - selected_inns
+        if unknown_inns:
+            parser.error('--confirm-form: ИНН не найден среди подтверждённых школ: ' + ', '.join(sorted(unknown_inns)))
+        save(result, args.output, overrides=form_overrides)
+        if args.import_decisions:
             save_store(args.decisions_store, decisions)
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, ParseError, InvalidFileException) as error:
         print(f'Ошибка обработки: {error}', file=sys.stderr)
