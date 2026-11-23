@@ -168,7 +168,7 @@ def inn_matches(source, candidate):
     source, candidate = str(source or '').strip(), str(candidate or '').strip()
     return bool(source and candidate) and (source == candidate or
         source.isascii() and candidate.isascii() and source.isdecimal() and candidate.isdecimal()
-        and len(source) < len(candidate) and valid_inn(candidate)
+        and len(source) < len(candidate) and not valid_inn(source) and valid_inn(candidate)
         and source.zfill(len(candidate)) == candidate)
 
 
@@ -387,10 +387,13 @@ def choose(record, candidates, config=None):
                     c['eligible'] = False
             eligible_inns = {c['candidate_inn'] for c in ranked if c['eligible']}
 
-    # Одинаковое официальное имя у разных ИНН требует проверки правопреемства.
+    # Географически и организационно совместимые одноимённые записи требуют проверки правопреемства.
     exact_name = normalize(record['name'])
+    plausible_reasons = {'ИНН_НЕ_СОВПАЛ', 'НЕДЕЙСТВУЮЩАЯ_ЗАПИСЬ',
+                         'НЕПОДТВЕРЖДЕННОЕ_ПРАВОПРЕЕМСТВО'}
     same_name = [c for c in ranked if c['candidate_inn'] and
-                 normalize(c['candidate_name']) == exact_name]
+                 normalize(c['candidate_name']) == exact_name and
+                 set(c['reasons']) <= plausible_reasons]
     if len({c['candidate_inn'] for c in same_name}) > 1:
         for c in ranked:
             if c['eligible'] or c in same_name:
