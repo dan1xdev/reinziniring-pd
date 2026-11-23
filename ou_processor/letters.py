@@ -424,11 +424,12 @@ def _students(students):
                 f"Некорректное или неполное ФИО: {full}"
             )
 
-        names[full].add(personal_file)
-        pairs.setdefault((_normalized(full), personal_file), full)
+        normalized_name = _normalized(full)
+        names[normalized_name].add(personal_file)
+        pairs.setdefault((normalized_name, personal_file), full)
 
         if personal_file:
-            names_per_file[personal_file].add(_normalized(full))
+            names_per_file[personal_file].add(normalized_name)
 
     if not names:
         notes.append("Нет сведений о поступивших")
