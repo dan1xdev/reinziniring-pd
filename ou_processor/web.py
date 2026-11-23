@@ -21,7 +21,10 @@ from .dadata import DaDataClient
 from .key_storage import TokenStore
 from .full_run import aggregate, save
 from .input import list_sheets, read_records
-from .manual_review import MAX_DECISION_BYTES, apply_import, load_result, load_store, save_store
+from .manual_review import (MAX_DECISION_BYTES, apply_choice, apply_import, load_result,
+                            load_store, review_rows, save_store, template_bytes)
+from .letters import valid_inn
+from .resolution import assess, convert
 from .license_registry import auto_update as license_auto_update
 from .license_registry import current_snapshot as current_license_snapshot
 from .pipeline import process
@@ -199,10 +202,22 @@ class Application:
                 return
             self.jobs[job_id].update(fields)
 
-    def snapshot(self, job_id):
+    def snapshot(self, job_id, verify_result=True):
+        folder = self.storage / job_id / 'result'
         with self.lock:
             job = self.jobs.get(job_id)
-            return dict(job) if job else None
+            if job:
+                if verify_result and job['status'] == 'done' and not (folder / 'result.json').is_file():
+                    return {**job, 'status': 'error', 'error': 'Файлы результата отсутствуют. Повторите обработку.'}
+                return dict(job)
+            if not re.fullmatch(r'[a-f0-9]{32}', job_id) or not (folder / 'result.json').is_file():
+                return None
+            try:
+                fields = self.result_fields(job_id, load_result(folder / 'result.json'))
+            except (OSError, ValueError, KeyError, TypeError):
+                return None
+            self.jobs[job_id] = dict(id=job_id, status='done', phase='Готово', progress=100, **fields)
+            return dict(self.jobs[job_id])
 
     def cancel(self, job_id):
         with self.lock:
@@ -233,6 +248,9 @@ class Application:
             self.jobs[job_id].update(status='done', phase='Готово', progress=100, **fields)
 
     def publish(self, job_id, result):
+        self.finish(job_id, **self.result_fields(job_id, result))
+
+    def result_fields(self, job_id, result):
         summary = result['full_summary']
         errors = [r['status'] for r in result['resolution']['requests'] if r['status'] != 'OK']
         warnings = list(result.get('warnings', []))
@@ -244,18 +262,33 @@ class Application:
         missing = summary['Строк без данных ученика']
         if missing:
             warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
-        self.finish(job_id,
+        return dict(
             summary={'rows': summary['Входных строк'], 'schools': len(result['schools']),
                      'students': len(result['students']),
                      'review': summary['Исходных строк на проверку'] + result['summary']['selection_review_rows'],
-                     'addresses': summary['Учреждений с адресом'], 'excluded': result['summary']['excluded_rows'],
+                     'addresses': summary['Учреждений с адресом'], 'excluded': result['summary'].get('excluded_rows', 0),
                      'verified': sum(bool(g.get('manual_decision')) for g in result['resolution']['groups'])},
+            review=review_rows(result)[:200],
+            selection_review=[{'name': r.get('name'), 'reason': r.get('selection_reason'),
+                               'education': r.get('education_kind')} for r in result['records']
+                              if r.get('selection') == 'ПРОВЕРИТЬ_ОТБОР'][:200],
             warnings=warnings, partial=bool(errors or source_fill.get('errors')), preview=result['schools'][:20],
             download=f'/api/jobs/{job_id}/download', journal=f'/api/jobs/{job_id}/journal',
             manual_template=f'/api/jobs/{job_id}/manual-template', manual_pending=len(result.get('review', [])),
             filled_sources=[{'source': item['source'], 'file': item['file'],
                              'url': f'/api/jobs/{job_id}/filled-sources/{index}'}
                             for index, item in enumerate(source_fill.get('copies', []))])
+
+    valid_inn = staticmethod(valid_inn)
+
+    def decisions_template(self, job_id):
+        return template_bytes(load_result(self.storage / job_id / 'result' / 'result.json'))
+
+    def load_manual_decisions(self):
+        return load_store(self.decisions_store)
+
+    def import_manual_decisions(self, job_id, payload):
+        return self.import_decisions(job_id, payload)
 
     def import_decisions(self, job_id, payload):
         if not isinstance(payload, dict) or not isinstance(payload.get('data'), str):
@@ -266,6 +299,38 @@ class Application:
             content = base64.b64decode(payload['data'], validate=True)
         except (ValueError, binascii.Error):
             raise UserError('Файл решений повреждён при загрузке.') from None
+        return self.update_review(job_id, lambda result: apply_import(result, content, self.load_manual_decisions()))
+
+    def decide(self, job_id, payload):
+        return self.update_review(job_id, lambda result: apply_choice(
+            result, self.load_manual_decisions(), payload.get('group_id'), payload.get('inn'), payload.get('comment', '')))
+
+    def check_dadata(self, job_id, payload):
+        def lookup(result):
+            group_id = payload.get('group_id')
+            group = next((g for g in result['resolution']['groups'] if g['group_id'] == group_id), None)
+            if not group or group.get('selected'):
+                raise UserError('Выберите группу из очереди ручной проверки.')
+            record = next(r for r in result['records'] if r['record_id'] == group['record_ids'][0])
+            token = payload.get('token')
+            if not isinstance(token, str) or not token.strip() or len(token) > 256 or any(c in token for c in '\r\n'):
+                raise UserError('Введите ключ DaData.')
+            query = ' '.join(filter(None, (record['name'], record.get('region'), record.get('city'))))
+            try:
+                suggestions = self.client_factory(token.strip()).suggest(query)
+            except Exception:
+                raise UserError('Не удалось получить ответ DaData. Проверьте ключ и повторите запрос.') from None
+            candidates = [dict(assess(record, convert(s, query)), group_id=group_id) for s in suggestions]
+            result['dadata_candidates'] = [c for c in result.get('dadata_candidates', [])
+                                           if c['group_id'] != group_id] + candidates
+            inns = sorted({c['candidate_inn'] for c in candidates if c.get('candidate_inn')})
+            result.setdefault('manual_dadata_checks', []).append({
+                'group_id': group_id, 'checked_at': datetime.now(timezone.utc).isoformat(),
+                'inns': ', '.join(inns), 'discrepancies': 'Несколько ИНН' if len(inns) > 1 else ''})
+            return result, None
+        return self.update_review(job_id, lookup)
+
+    def update_review(self, job_id, operation):
         with self.lock:
             job = self.jobs.get(job_id)
             if not job or job['status'] != 'done':
@@ -276,13 +341,14 @@ class Application:
         try:
             folder = self.storage / job_id / 'result'
             result = load_result(folder / 'result.json')
-            updated, decisions = apply_import(result, content, load_store(self.decisions_store))
+            updated, decisions = operation(result)
             aggregate(updated)
             # При недоступном справочнике сохраняем возможность повторить импорт.
-            save_store(self.decisions_store, decisions)
+            if decisions is not None:
+                save_store(self.decisions_store, decisions)
             save(updated, folder)
             self.publish(job_id, updated)
-            return {'imported': updated['manual_import']['imported'], 'job': self.snapshot(job_id)}
+            return {'imported': updated['manual_import']['imported'] if decisions is not None else 0, 'job': self.snapshot(job_id)}
         except (OSError, ValueError, KeyError) as error:
             if isinstance(error, ValueError) and not isinstance(error, json.JSONDecodeError):
                 raise UserError(str(error)) from None
@@ -306,7 +372,7 @@ class Application:
                 path.write_bytes(content)
                 paths.append(path)
                 sheet_names[str(path.resolve())] = sheets[index] if sheets else ''
-            config = json.loads((ROOT / 'config.json').read_text())
+            config = json.loads((ROOT / 'config.json').read_text(encoding='utf-8'))
             records, sources = read_records(paths, should_cancel=lambda: self.check_cancel(job_id), sheet_names=sheet_names, config=config)
             self.check_cancel(job_id)
             if len(records) > 5000:
@@ -409,9 +475,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, path.read_bytes(),
                 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 attachment=f'filled_source_{index + 1}.xlsx')
-        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download|/journal|/manual-template)?', self.path)
+        match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})(/download|/journal|/manual-template|/decisions-template)?', self.path)
         if match:
-            job = self.app.snapshot(match[1])
+            job = self.app.snapshot(match[1], verify_result=match[2] != '/journal')
             if job:
                 if not match[2]:
                     return self.send(200, job)
@@ -419,8 +485,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(409, {'error': 'Результат ещё не готов.'})
                 if match[2] == '/journal':
                     path = self.app.storage / match[1] / 'result' / 'processing_log.json'
+                    if not path.is_file():
+                        return self.send(404, {'error': 'Журнал отсутствует.'})
                     return self.send(200, path.read_bytes(), 'application/octet-stream', attachment='processing_log.json')
-                if match[2] == '/manual-template':
+                if match[2] in {'/manual-template', '/decisions-template'}:
                     path = self.app.storage / match[1] / 'result' / 'manual_decisions.xlsx'
                     return self.send(200, path.read_bytes(),
                         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', attachment='manual_decisions.xlsx')
@@ -450,7 +518,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {'token_configured': False, 'token_saved': False})
             except UserError as error:
                 return self.send(400, {'error': str(error)})
-        import_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/decisions-import', self.path)
+        import_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/(decisions-import|decisions|dadata)', self.path)
         if self.path not in {'/api/jobs', '/api/sheets'} and not import_match:
             return self.send(404, {'error': 'Не найдено.'})
         try:
@@ -463,7 +531,11 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.settimeout(60)
             payload = json.loads(self.rfile.read(size))
             if import_match:
-                return self.send(200, self.app.import_decisions(import_match[1], payload))
+                if not isinstance(payload, dict):
+                    raise UserError('Неверные параметры запроса.')
+                handlers = {'decisions-import': self.app.import_decisions, 'decisions': self.app.decide,
+                            'dadata': self.app.check_dadata}
+                return self.send(200, handlers[import_match[2]](import_match[1], payload))
             if self.path == '/api/sheets':
                 return self.send(200, self.app.inspect(payload))
             job_id = self.app.start(payload)

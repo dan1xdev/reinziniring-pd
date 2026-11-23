@@ -101,6 +101,7 @@ def write_log(result, destination):
         'selection': [{k: r.get(k) for k in ('record_id', 'source_file', 'source_sheet', 'source_row',
                                             'selection', 'selection_reason', 'flags', 'region_evidence', 'city_evidence')}
                       for r in result['records']],
+        'manual_dadata_checks': result.get('manual_dadata_checks', []),
         'dadata_checks': result.get('dadata_checks', []),
         'dadata_requests': result['resolution']['requests'],
         'dadata_actual_requests': result['resolution']['actual_requests'],

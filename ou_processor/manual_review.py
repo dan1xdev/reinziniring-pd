@@ -212,6 +212,20 @@ def apply_import(result, content, entries):
         staged.append((group_id, options[0], comment))
     if not staged:
         raise ManualReviewError('В файле нет заполненных решений.')
+    return apply_choices(result, entries, staged)
+
+
+def apply_choice(result, entries, group_id, inn, comment):
+    row = next((row for row in review_rows(result) if row['group_id'] == group_id), None)
+    candidate = next((c for c in row['options'] if _valid_candidate(c, inn)), None) if row else None
+    if not candidate:
+        raise ManualReviewError('Выберите действующего кандидата из списка этой группы.')
+    if not isinstance(comment, str) or len(comment) > 1000:
+        raise ManualReviewError('Комментарий должен содержать не более 1 000 символов.')
+    return apply_choices(result, entries, [(group_id, candidate, comment.strip())])
+
+
+def apply_choices(result, entries, staged):
     updated, saved = deepcopy(result), deepcopy(entries)
     groups = {g['group_id']: g for g in updated['resolution']['groups']}
     records = {r['record_id']: r for r in updated['records']}

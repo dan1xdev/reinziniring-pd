@@ -4,3 +4,5 @@
 #check-dadata{width:100%;margin-top:10px}.file-list li{flex-wrap:wrap}.file-list label{width:100%;display:flex;align-items:center;gap:10px;color:var(--muted)}.file-list select{flex:1;min-width:0;padding:7px;border:1px solid var(--line);border-radius:6px;background:white;color:var(--ink)}select:focus-visible{outline:3px solid #64b59c;outline-offset:3px}
 
 #manual-review{margin-top:22px;padding:16px;border:1px solid var(--line);border-radius:8px}#manual-review p,#manual-review label{font-size:12px}#manual-review input{display:block;margin-top:8px;max-width:100%}
+
+.review-card{border:1px solid #d8dee8;border-radius:12px;padding:16px;margin:12px 0;background:#fff}.review-card h4{margin:0 0 6px}.review-card select,.review-card textarea{display:block;width:100%;margin:10px 0;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font:inherit}.review-card textarea{min-height:72px;resize:vertical}.decision-status{margin-bottom:0}

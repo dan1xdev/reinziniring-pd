@@ -197,7 +197,72 @@ $('forget-token').onclick = async () => {
     $('token').value = ''; await refreshRegistry();
   } catch (error) { showError(error.message); }
 };
+async function saveDecision(groupId, inn, comment, button, card) {
+  button.disabled = true;
+  try {
+    const result = await request('/api/jobs/' + currentJob + '/decisions', {
+      method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf},
+      body:JSON.stringify({group_id:groupId, inn, comment})
+    });
+    renderResult(result.job);
+  } catch (error) { showError(error.message); button.disabled = false; }
+}
+function renderManualReview(items, selectionItems=[]) {
+  const section = $('manual-review'), list = $('review-list');
+  list.replaceChildren();
+  const pending = (items || []).filter(item => item.status !== 'ПРОВЕРЕНО');
+  section.hidden = false; // Очередь видна даже при недоступном реестре и пустом поиске.
+  if (!pending.length && !selectionItems.length) {
+    const note=document.createElement('p'); note.className='muted';
+    note.textContent='Нет записей для ручной проверки в этом запуске.'; list.append(note);
+  }
+  selectionItems.forEach(item => {
+    const card=document.createElement('article'); card.className='review-card';
+    const heading=document.createElement('h4'); heading.textContent=item.name || 'Без названия'; card.append(heading);
+    const explanation=document.createElement('p'); explanation.textContent='Проверка исходных данных: '+(item.reason || 'Недостаточно данных')+'. Вид образования: '+(item.education || 'не определён')+'. Уточните вид образования в исходном Excel и повторите обработку. Выбор ИНН недоступен до отбора записи.'; card.append(explanation);
+    list.append(card);
+  });
+  pending.forEach(item => {
+    const card = document.createElement('article'); card.className = 'review-card';
+    const title = document.createElement('h4'); title.textContent = item.source_name || 'Учреждение без названия'; card.append(title);
+    const meta = document.createElement('p'); meta.className = 'muted'; meta.textContent = [item.region,item.city].filter(Boolean).join(' · '); card.append(meta);
+    const reason = document.createElement('p'); reason.textContent = 'Причина проверки: ' + (item.reason || 'Требуется ручное решение'); card.append(reason);
+    const select = document.createElement('select'); select.setAttribute('aria-label','Кандидат для подтверждения');
+    const placeholder = document.createElement('option'); placeholder.value=''; placeholder.textContent='Выберите кандидата'; select.append(placeholder);
+    (item.options || []).slice(0,3).forEach(c => {
+      const option = document.createElement('option'); option.value=String(c.candidate_inn || '');
+      option.textContent = `${c.candidate_name || 'Без названия'} — ИНН ${c.candidate_inn || 'нет'} — ${c.address || 'адрес не указан'} — балл ${c.score ?? 'н/д'} — источник ${c.source || 'не указан'} — ${(c.reasons || []).join(', ') || 'требует подтверждения'}`;
+      select.append(option);
+    });
+    card.append(select);
+    if (!(item.options || []).length) {
+      const note=document.createElement('p'); note.className='muted';
+      note.textContent='Кандидатов пока нет: локальный реестр недоступен или поиск не дал результатов. Дождитесь загрузки реестра и повторите обработку либо нажмите «Проверить в DaData». Без подтверждённого кандидата ИНН выбрать нельзя.';
+      card.append(note); select.disabled=true;
+    }
+    const dadata = document.createElement('button'); dadata.type='button'; dadata.className='secondary'; dadata.textContent='Проверить в DaData';
+    dadata.onclick = async () => {
+      const token = prompt('Введите API-ключ DaData. Запрос отправит название и географию учреждения, но не ФИО и номера личных дел.');
+      if (!token) return;
+      dadata.disabled = true;
+      try {
+        const result = await request('/api/jobs/' + currentJob + '/dadata', {method:'POST',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf},
+          body:JSON.stringify({group_id:item.group_id, token})});
+        renderResult(result.job);
+      } catch (error) { showError(error.message); dadata.disabled = false; }
+    };
+    card.append(dadata);
+    const comment = document.createElement('textarea'); comment.maxLength=1000; comment.placeholder='Комментарий (необязательно)'; comment.setAttribute('aria-label','Комментарий к решению'); card.append(comment);
+    const save = document.createElement('button'); save.type='button'; save.className='secondary'; save.textContent='Подтвердить ИНН';
+    const status = document.createElement('p'); status.className='decision-status muted';
+    save.onclick = () => { if (!select.value) return showError('Выберите ИНН из списка кандидатов.'); saveDecision(item.group_id, select.value, comment.value, save, card); };
+    if (!(item.options || []).length) save.disabled=true;
+    card.append(save,status); list.append(card);
+  });
+}
 function renderResult(job) {
+  renderManualReview(job.review || [], job.selection_review || []);
   $('result').hidden = false; $('download').href = job.download;
   $('filled-downloads').replaceChildren();
   for (const source of job.filled_sources || []) {

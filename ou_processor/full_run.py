@@ -761,6 +761,11 @@ def save(result, output, overrides=None):
         ],
     )
 
+    if result.get('manual_dadata_checks'):
+        add_table(book, 'Ручные проверки DaData', result['manual_dadata_checks'], [
+            ('group_id', 'Группа'), ('checked_at', 'Время UTC'), ('inns', 'ИНН DaData'),
+            ('discrepancies', 'Расхождения')])
+
     if 'dadata_checks' in result:
         add_table(book, 'Сверка DaData', result['dadata_checks'], [
             ('group_id', 'Группа'), ('registry_inn', 'ИНН из реестра'),
