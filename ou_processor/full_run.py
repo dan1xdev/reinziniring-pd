@@ -218,7 +218,15 @@ def aggregate(result):
                 ),
             })
 
+        by_name = {}
+        for person in people:
+            key = normalize(person["name"]).replace("ё", "е") if person["name"] else tuple(person["record_ids"])
+            entry = by_name.setdefault(key, {"name": person["name"], "files": []})
+            entry["files"].append(person["file"] or "Номер отсутствует")
         notes = []
+        if any(entry["name"] and len(set(entry["files"]) - {"Номер отсутствует"}) > 1
+               for entry in by_name.values()):
+            notes.append("Одно ФИО связано с разными личными делами — проверить возможных тёзок")
 
         if any(
             len(names) > 1
@@ -259,15 +267,9 @@ def aggregate(result):
         schools.append({
             "school_name": candidate["candidate_name"],
             "address": address,
-            "students": "\n".join(
-                person["name"] or "ФИО отсутствует"
-                for person in people
-            ),
-            "files": "\n".join(
-                person["file"] or "Номер отсутствует"
-                for person in people
-            ),
-            "student_count": len(people),
+            "students": "\n".join(entry["name"] or "ФИО отсутствует" for entry in by_name.values()),
+            "files": "\n".join(", ".join(entry["files"]) for entry in by_name.values()),
+            "student_count": sum(bool(entry["name"]) for entry in by_name.values()),
             "inn": inn,
             "ogrn": candidate["candidate_ogrn"],
             "postal_code": candidate["postal_code"],
@@ -324,6 +326,7 @@ def aggregate(result):
         "Пар ФИО и номер дела после объединения": len(
             students
         ),
+        "Поступивших по ФИО внутри учреждения": sum(row["student_count"] for row in schools),
         "Групп на проверку": len(review),
         "Групп сопоставлено через реестр лицензий": sum(
             bool(group["selected"])
@@ -545,7 +548,7 @@ def save(result, output, overrides=None):
             ("address", "Адрес организации"),
             ("students", "ФИО учеников"),
             ("files", "Номера личных дел"),
-            ("student_count", "Учеников / дел"),
+            ("student_count", "Поступивших по ФИО"),
             ("postal_code", "Индекс"),
             ("inn", "ИНН"),
             ("source", "Источник адреса"),

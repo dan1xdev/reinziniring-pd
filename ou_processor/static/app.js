@@ -261,7 +261,37 @@ function renderManualReview(items, selectionItems=[]) {
     card.append(save,status); list.append(card);
   });
 }
+function renderForms(rows) {
+  const form = $('form-review'), schools = $('form-school');
+  form.hidden = !rows.length;
+  schools.replaceChildren();
+  if (!rows.length) return;
+  for (const row of rows) schools.add(new Option(row.official_name + ' · ' + row.inn, row.inn));
+  schools.onchange = () => {
+    const row = rows[schools.selectedIndex];
+    $('form-official').value = row.official_name;
+    $('form-genitive').value = row.genitive_name;
+    $('form-reasons').textContent = row.checks;
+  };
+  schools.onchange();
+  form.onsubmit = async event => {
+    event.preventDefault();
+    const button = form.querySelector('button');
+    button.disabled = true;
+    try {
+      const response = await request('/api/jobs/' + currentJob + '/confirm-form', {
+        method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':config.csrf},
+        body:JSON.stringify({inn:schools.value, official_name:$('form-official').value,
+                             genitive_name:$('form-genitive').value})
+      });
+      renderResult(response.job);
+      $('manual-status').textContent = 'Формы названия сохранены. Отчёт и копии Excel обновлены.';
+    } catch (error) { showError(error.message); }
+    finally { button.disabled = false; }
+  };
+}
 function renderResult(job) {
+  renderForms(job.form_review || []);
   renderManualReview(job.review || [], job.selection_review || []);
   $('result').hidden = false; $('download').href = job.download;
   $('filled-downloads').replaceChildren();
@@ -282,7 +312,7 @@ function renderResult(job) {
   updateButton();
   $('result-title').textContent = job.partial ? 'Таблица готова частично' : 'Таблица готова';
   $('metrics').replaceChildren();
-  for (const [value, label] of [[job.summary.rows,'строк обработано'],[job.summary.schools,'учреждений объединено'],[job.summary.students,'пар ФИО и номер дела'],[job.summary.review,'строк требуют проверки']]) {
+  for (const [value, label] of [[job.summary.rows,'строк обработано'],[job.summary.schools,'учреждений объединено'],[job.summary.students,'поступивших по ФИО'],[job.summary.files,'пар ФИО и номер дела'],[job.summary.review,'строк требуют проверки']]) {
     const box = document.createElement('div'), number = document.createElement('strong'), text = document.createElement('span');
     box.className = 'metric'; number.textContent = value; text.textContent = label; box.append(number, text); $('metrics').append(box);
   }

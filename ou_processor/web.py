@@ -264,10 +264,15 @@ class Application:
             warnings.append(f'В {missing} исходных строках нет ФИО и/или номера личного дела.')
         return dict(
             summary={'rows': summary['Входных строк'], 'schools': len(result['schools']),
-                     'students': len(result['students']),
+                     'students': sum(school['student_count'] for school in result['schools']),
+                     'files': len(result['students']),
                      'review': summary['Исходных строк на проверку'] + result['summary']['selection_review_rows'],
                      'addresses': summary['Учреждений с адресом'], 'excluded': result['summary'].get('excluded_rows', 0),
                      'verified': sum(bool(g.get('manual_decision')) for g in result['resolution']['groups'])},
+            form_review=[{key: row.get(key, '') for key in ('inn', 'official_name', 'genitive_name', 'checks')}
+                         for row in result.get('letters_review', [])
+                         if row.get('match_status') in {'АВТО', 'ПРОВЕРЕНО'}
+                         and any(word in row.get('checks', '') for word in ('Регистр', 'падеж', 'кавычки'))],
             review=review_rows(result)[:200],
             selection_review=[{'name': r.get('name'), 'reason': r.get('selection_reason'),
                                'education': r.get('education_kind')} for r in result['records']
@@ -304,6 +309,25 @@ class Application:
     def decide(self, job_id, payload):
         return self.update_review(job_id, lambda result: apply_choice(
             result, self.load_manual_decisions(), payload.get('group_id'), payload.get('inn'), payload.get('comment', '')))
+
+    def confirm_form(self, job_id, payload):
+        def confirm(result):
+            inn = payload.get('inn')
+            if not isinstance(inn, str) or not valid_inn(inn) or not any(
+                    (group.get('selected') or {}).get('candidate_inn') == inn
+                    for group in result['resolution']['groups']):
+                raise UserError('Выберите подтверждённое учреждение.')
+            forms = {}
+            for field in ('official_name', 'genitive_name'):
+                value = payload.get(field)
+                if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+                    raise UserError('Введите оба названия длиной до 2 000 символов.')
+                if value.count('«') != value.count('»'):
+                    raise UserError('Проверьте парность кавычек.')
+                forms[field] = value.strip()
+            result.setdefault('form_overrides', {})[inn] = {**forms, 'verified': True}
+            return result, None
+        return self.update_review(job_id, confirm)
 
     def check_dadata(self, job_id, payload):
         def lookup(result):
@@ -518,7 +542,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {'token_configured': False, 'token_saved': False})
             except UserError as error:
                 return self.send(400, {'error': str(error)})
-        import_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/(decisions-import|decisions|dadata)', self.path)
+        import_match = re.fullmatch(r'/api/jobs/([a-f0-9]{32})/(decisions-import|decisions|dadata|confirm-form)', self.path)
         if self.path not in {'/api/jobs', '/api/sheets'} and not import_match:
             return self.send(404, {'error': 'Не найдено.'})
         try:
@@ -534,7 +558,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(payload, dict):
                     raise UserError('Неверные параметры запроса.')
                 handlers = {'decisions-import': self.app.import_decisions, 'decisions': self.app.decide,
-                            'dadata': self.app.check_dadata}
+                            'dadata': self.app.check_dadata, 'confirm-form': self.app.confirm_form}
                 return self.send(200, handlers[import_match[2]](import_match[1], payload))
             if self.path == '/api/sheets':
                 return self.send(200, self.app.inspect(payload))

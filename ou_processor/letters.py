@@ -12,7 +12,6 @@ LETTER_COLUMNS = [
     ("address", "Адрес без индекса"),
     ("region", "Регион"),
     ("students", "Поступившие"),
-    ("files", "Номера личных дел"),
     ("student_count", "Количество поступивших"),
     ("match_status", "Статус сопоставления"),
     ("status", "Готовность"),
@@ -28,6 +27,7 @@ LETTER_COLUMNS = [
     ("letter_fragment", "Текст для письма"),
     ("checks", "Причины проверки"),
     ("source_record_ids", "Исходные записи"),
+    ("files", "Номера личных дел"),
 ]
 
 
@@ -287,22 +287,35 @@ _GENITIVE_ADJECTIVES = {
     "общеобразовательное": "общеобразовательного",
     "профессиональное": "профессионального",
     "дошкольное": "дошкольного",
+    "государственная": "государственной",
+    "автономная": "автономной",
+    "муниципальная": "муниципальной",
+    "бюджетная": "бюджетной",
+    "образовательная": "образовательной",
+    "некоммерческая": "некоммерческой",
+    "нетиповая": "нетиповой",
+    "нетиповое": "нетипового",
+    "многопрофильный": "многопрофильного",
+    "образовательный": "образовательного",
+    "краевое": "краевого",
+    "областное": "областного",
+    "частная": "частной",
     "средняя": "средней",
     "основная": "основной",
     "начальная": "начальной",
     "общеобразовательная": "общеобразовательной",
     "специальная": "специальной",
     "коррекционная": "коррекционной",
-    "автономная": "автономной",
-    "некоммерческая": "некоммерческой",
     "профессиональная": "профессиональной",
-    "образовательная": "образовательной",
 }
 
 _NOUNS = {
+    "центр": "центра",
     "учреждение": "учреждения",
     "организация": "организации",
     "школа": "школы",
+    "школа-интернат": "школы-интерната",
+    "лицей-интернат": "лицея-интерната",
     "гимназия": "гимназии",
     "академия": "академии",
     "университет": "университета",
@@ -314,14 +327,18 @@ _NOUNS = {
 
 
 _GENITIVE_FORMS = {**_GENITIVE_ADJECTIVES, **_NOUNS}
-_NOMINATIVE_FORMS = {genitive: nominative for nominative, genitive in _GENITIVE_FORMS.items()}
 _PROPER_WORD = r"[А-ЯЁ][а-яё]+(?:-[А-ЯЁа-яё]+)*"
 _PRESERVED_GENITIVE_TAIL = re.compile(
     rf"(?:города|[Рр]еспублики)\s+{_PROPER_WORD}(?:\s+{_PROPER_WORD})*"
-    r"|[А-ЯЁ][а-яё-]*(?:ой|ого|его)\s+(?:области|края|[Рр]еспублики)"
+    r"|(?i:[а-яё-]+(?:ой|ого|его)\s+(?:(?:автономного|муниципального)\s+)?(?:области|края|района|округа|республики))"
+    rf"|(?i:[а-яё-]+(?:ого|его) района)\s+{_PROPER_WORD}"
+    r"|(?i:муниципального образования|городского округа|муниципального округа)"
     r"|(?:(?:среднего|основного|начального|высшего|дополнительного|"
     r"профессионального|общего|дошкольного)\s+)*образования"
-    r"|№\s*\d+"
+    r"|(?i:г\.\s*[а-яё-]+|(?:городского округа|г\.о\.|муниципального образования город)\s+[а-яё-]+)"
+    r"|(?i:республики марий эл|с углубл[её]нным изучением отдельных предметов)"
+    r"|(?i:имени|им\.)\s+(?:[А-ЯЁ]\.\s*)*[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+){0,2}"
+    r"|[-–—]|№\s*\d+"
 )
 
 
@@ -347,7 +364,6 @@ def genitive_official_name(name):
     outside, separator, inside = name.partition("«")
     words = outside.strip().split()
     converted = list(words)
-    changed = []
     index, has_head = 0, False
 
     while index < len(words):
@@ -363,23 +379,14 @@ def genitive_official_name(name):
                 if word.isupper():
                     return "", False
                 converted[index] = _initial_case(_GENITIVE_FORMS[word.casefold()], word)
-                changed.append(index)
             index += 1
         if index == len(words) or words[index].casefold() not in _NOUNS or words[index].isupper():
             return "", False
         converted[index] = _initial_case(_NOUNS[words[index].casefold()], words[index])
-        changed.append(index)
         has_head = True
         index += 1
 
-    # Обратная проверка изменённых слов по словарю; хвосты и цитируемое название не склоняются.
-    restored = list(converted)
-    for index in changed:
-        original_form = _NOMINATIVE_FORMS.get(converted[index].casefold())
-        if original_form is None:
-            return "", False
-        restored[index] = _initial_case(original_form, converted[index])
-    if not has_head or restored != words:
+    if not has_head:
         return "", False
     result = ' '.join(converted)
     if separator:
@@ -509,6 +516,15 @@ def _prepare_one(inn, groups, students, override=None):
         chosen.get("candidate_name", "")
     )
 
+    if restored:
+        # Используем регистр исходной записи только при полном совпадении текста с реестром.
+        registry_name = _value(chosen.get("candidate_name")).casefold()
+        spellings = {g["source_name"] for g in groups if g.get("source_name")
+                     and _value(g["source_name"]).casefold() == registry_name
+                     and not g["source_name"].isupper() and not g["source_name"].islower()}
+        if len(spellings) == 1:
+            official_name, restored = official_typography(spellings.pop())
+
     if not official_name:
         checks.append("Отсутствует официальное название")
 
@@ -602,11 +618,11 @@ def _prepare_one(inn, groups, students, override=None):
 
     people, source_ids, person_notes = _students(students)
     checks.extend(person_notes)
-    people_names = [person["name"] for person in people]
+    people_names = list({_normalized(person["name"]): person["name"] for person in people}.values())
 
-    if len(people) == 1:
+    if len(people_names) == 1:
         kind = "Для одного поступившего"
-    elif len(people) > 1:
+    elif len(people_names) > 1:
         kind = "Для нескольких поступивших"
     else:
         kind = "Не определён"
@@ -614,7 +630,7 @@ def _prepare_one(inn, groups, students, override=None):
     fragment = ""
 
     if people and genitive:
-        if len(people) == 1:
+        if len(people_names) == 1:
             fragment = (
                 f"Благодарим коллектив {genitive} "
                 "за подготовку к поступлению.\n"
@@ -641,7 +657,7 @@ def _prepare_one(inn, groups, students, override=None):
         "genitive_name": genitive,
         "students": ", ".join(people_names),
         "files": "\n".join(person["file"] for person in people),
-        "student_count": len(people),
+        "student_count": len(people_names),
         "postal_code": code,
         "address": address,
         "mailing_address": (
